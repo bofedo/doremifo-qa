@@ -1,16 +1,17 @@
 """
-DoReMiFo QA — FastAPI backend v1.7
+DoReMiFo QA — FastAPI backend v1.8
 - Railway Volume pre perzistentné úložisko (/app/data)
 - Composer tokeny + unikátne upload linky
 - Progress tracking per skladateľ per bunka
 - Slack notifikácia pri každej kompletnej bunke
 - WAV archív per skladateľ
 - Admin dashboard s maticou buniek
+- Download endpoint pre stiahnutie súborov
 """
 
-import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re
+import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io
 from fastapi import FastAPI, File, UploadFile, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from typing import List
 
 app = FastAPI(title="DoReMiFo QA")
@@ -94,21 +95,22 @@ def detect_source(json_path: str):
         def mean(k):
             v = ll.get(k)
             return v.get("mean") if isinstance(v, dict) else (v or 0)
-        flatness   = mean("spectral_flatness_db") or mean("spectral_flatness") or 0
-        inharmonic = mean("inharmonicity") or 0
-        complexity = mean("spectral_complexity") or 0
-        onset_rate = j.get("rhythm", {}).get("onset_rate") or 0
+        flatness       = mean("spectral_flatness_db") or mean("spectral_flatness") or 0
+        inharmonic     = mean("inharmonicity") or 0
+        complexity     = mean("spectral_complexity") or 0
+        onset_rate     = j.get("rhythm", {}).get("onset_rate") or 0
+        pitch_salience = mean("pitch_salience") or 0
         if onset_rate > 8 and complexity < 5:
-            return "Sample / perkusívny", "Sample / percussive", 1.6
-        if flatness > -12 and inharmonic > 0.15:
-            return "FM syntéza", "FM synthesis", 1.4
-        if flatness > -6:
-            return "Zmiešaný / hybridný", "Mixed / hybrid", 2.0
+            return "Sample / perkusívny", "Sample / percussive"
+        if inharmonic > 0.15 and pitch_salience < 0.6:
+            return "FM syntéza", "FM synthesis"
         if inharmonic > 0.25 or complexity > 18:
-            return "Akustická nahrávka", "Acoustic recording", 2.0
-        return "Subtraktívna syntéza", "Subtractive synthesis", 1.0
+            return "Akustická nahrávka", "Acoustic recording"
+        if flatness > -6 and pitch_salience < 0.5:
+            return "Zmiešaný / hybridný", "Mixed / hybrid"
+        return "Subtraktívna syntéza", "Subtractive synthesis"
     except Exception:
-        return "Neznámy", "Unknown", 1.5
+        return "Neznámy", "Unknown"
 
 # ── Upload UI ─────────────────────────────────────────────
 
@@ -293,7 +295,7 @@ async function upload(){{
     if(!res.ok) throw new Error(data.error||'Error');
     st.className='status ok';
     st.textContent=data.complete?T.done_all:T.done_part;
-    if(data.report_html) {{
+    if(data.report_html){{
       const w=window.open('','_blank');
       w.document.write(data.report_html);
       w.document.close();
@@ -323,6 +325,7 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
             else:
                 cells_html += '<td style="color:#334155;text-align:center;font-size:.8rem">—</td>'
         pct = round(total / 100 * 100)
+        cell_options = "".join(f'<option value="{c}">{c}</option>' for c in CELLS_ALL)
         rows += f"""<tr>
           <td><strong>{c['name']}</strong><br>
             <span style="font-size:.72rem;color:#475569">{c['created_at'][:10]}</span></td>
@@ -334,14 +337,12 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
           <td>
             <code style="font-size:.72rem;color:#7dd3fc">/upload/{token}</code><br>
             <a href="/download/{token}?secret={ADMIN_SECRET}"
-               style="font-size:.72rem;color:#4ade80;text-decoration:none">
-               ⬇ Všetko
-            </a>
+               style="font-size:.72rem;color:#4ade80;text-decoration:none">⬇ Všetko</a>
             &nbsp;
             <select onchange="if(this.value) window.location='/download/{token}?secret={ADMIN_SECRET}&cell='+this.value"
               style="font-size:.72rem;background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:4px;padding:.1rem .3rem;cursor:pointer">
               <option value="">⬇ Bunka...</option>
-              {''.join(f'<option value="{c}">{c}</option>' for c in CELLS_ALL)}
+              {cell_options}
             </select>
           </td>
         </tr>"""
@@ -412,15 +413,15 @@ async def index():
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DoReMiFo QA</title>
 <style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
        background:#0f172a;color:#e2e8f0;min-height:100vh;
-       display:flex;align-items:center;justify-content:center;padding:2rem}}
-  .card{{background:#1e293b;border-radius:16px;padding:3rem 2.5rem;
-         width:100%;max-width:480px;text-align:center}}
-  h1{{font-size:1.6rem;color:#f1f5f9;margin-bottom:.5rem}}
-  p{{color:#64748b;font-size:.9rem;line-height:1.6;margin-bottom:1rem}}
-  .note{{font-size:.8rem;color:#334155;margin-top:2rem}}
+       display:flex;align-items:center;justify-content:center;padding:2rem}
+  .card{background:#1e293b;border-radius:16px;padding:3rem 2.5rem;
+        width:100%;max-width:480px;text-align:center}
+  h1{font-size:1.6rem;color:#f1f5f9;margin-bottom:.5rem}
+  p{color:#64748b;font-size:.9rem;line-height:1.6;margin-bottom:1rem}
+  .note{font-size:.8rem;color:#334155;margin-top:2rem}
 </style></head><body>
 <div class="card">
   <h1>🎵 DoReMiFo QA</h1>
@@ -510,7 +511,6 @@ async def do_upload(
             with open(wav_path, "wb") as f:
                 shutil.copyfileobj(wav.file, f)
 
-            # Normalizácia
             norm = wav_path.replace(".wav", "_norm.wav")
             try:
                 subprocess.run(
@@ -520,19 +520,16 @@ async def do_upload(
             except Exception:
                 pass
 
-            # Essentia extrakcia
             json_path = os.path.join(json_dir, f"CELL{cell}_{var_id}.json")
             subprocess.run(
                 ["essentia_streaming_extractor_music", wav_path, json_path],
                 capture_output=True)
 
-            # Ulož do archívu (Railway Volume)
             shutil.copy(wav_path, os.path.join(composer_dir, wav_name))
             if os.path.exists(json_path):
                 shutil.copy(json_path, os.path.join(
                     composer_dir, f"CELL{cell}_{var_id}.json"))
 
-            # VAR01 → referencia
             if var_id == "VAR01":
                 shutil.copy(wav_path, os.path.join(
                     REFS_DIR, f"CELL{cell}_VAR01_{token}.wav"))
@@ -542,7 +539,7 @@ async def do_upload(
 
             source_sk = "Neznámy"
             if os.path.exists(json_path):
-                source_sk, _, _ = detect_source(json_path)
+                source_sk, _ = detect_source(json_path)
 
             with get_db() as db:
                 db.execute("""INSERT OR REPLACE INTO uploads
@@ -565,19 +562,17 @@ async def do_upload(
             f"*Varianty:* 10/10 ✅"
         )
 
-    # Vygeneruj QA report ak máme VAR01 referenciu
+    # Vygeneruj QA report
     report_html = None
     ref_wav  = os.path.join(REFS_DIR, f"CELL{cell}_VAR01_{token}.wav")
     ref_json = os.path.join(REFS_DIR, f"CELL{cell}_VAR01_{token}.json")
 
-    if os.path.exists(ref_wav) and os.path.exists(ref_json) and len(uploaded_now) > 0:
+    if os.path.exists(ref_wav) and os.path.exists(ref_json) and uploaded_now:
         with tempfile.TemporaryDirectory() as tmp2:
             w2 = os.path.join(tmp2, "wav")
             j2 = os.path.join(tmp2, "json")
             o2 = os.path.join(tmp2, "out")
             os.makedirs(w2); os.makedirs(j2); os.makedirs(o2)
-
-            # Skopíruj všetky dostupné archivované súbory bunky
             src_dir = os.path.join(ARCH_DIR, token, f"cell{cell}")
             if os.path.exists(src_dir):
                 for fname in os.listdir(src_dir):
@@ -585,24 +580,54 @@ async def do_upload(
                         shutil.copy(os.path.join(src_dir, fname), os.path.join(w2, fname))
                     elif fname.endswith(".json"):
                         shutil.copy(os.path.join(src_dir, fname), os.path.join(j2, fname))
-
             proc = subprocess.run([
                 "python3", "/app/analyze_cell.py",
-                "--cell", cell,
-                "--in",   j2,
-                "--wav",  w2,
-                "--out",  o2,
+                "--cell", cell, "--in", j2, "--wav", w2, "--out", o2,
             ], capture_output=True, text=True)
-
             report_path = os.path.join(o2, f"cell{cell}_qa_report.html")
             if os.path.exists(report_path):
                 with open(report_path) as f:
                     report_html = f.read()
 
-    return {
-        "ok":          True,
-        "complete":    complete,
-        "uploaded":    uploaded_now,
-        "total_cell":  total_cell,
-        "report_html": report_html,
-    }
+    return {"ok": True, "complete": complete,
+            "uploaded": uploaded_now, "total_cell": total_cell,
+            "report_html": report_html}
+
+
+@app.get("/download/{token}")
+async def download_composer(token: str, secret: str = "", cell: str = ""):
+    if secret != ADMIN_SECRET:
+        return JSONResponse(status_code=403, content={"error": "Prístup zamietnutý"})
+    with get_db() as db:
+        c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
+        if not c:
+            return JSONResponse(status_code=404, content={"error": "Skladateľ nenájdený"})
+    composer_dir = os.path.join(ARCH_DIR, token)
+    if not os.path.exists(composer_dir):
+        return JSONResponse(status_code=404, content={"error": "Žiadne súbory"})
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if cell:
+            cell_dir = os.path.join(composer_dir, f"cell{cell.zfill(2)}")
+            if os.path.exists(cell_dir):
+                for fname in sorted(os.listdir(cell_dir)):
+                    zf.write(os.path.join(cell_dir, fname), f"cell{cell.zfill(2)}/{fname}")
+        else:
+            for cd in sorted(os.listdir(composer_dir)):
+                full = os.path.join(composer_dir, cd)
+                if os.path.isdir(full):
+                    for fname in sorted(os.listdir(full)):
+                        zf.write(os.path.join(full, fname), f"{cd}/{fname}")
+
+    buf.seek(0)
+    name = c["name"].replace(" ", "_")
+    suffix = f"_cell{cell.zfill(2)}" if cell else ""
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=doremifo_{name}{suffix}.zip"})
+
+
+@app.get("/refs")
+async def list_refs():
+    return []
