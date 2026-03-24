@@ -339,7 +339,7 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
             <a href="/download/{token}?secret={ADMIN_SECRET}"
                style="font-size:.72rem;color:#4ade80;text-decoration:none">⬇ Všetko</a>
             &nbsp;
-            <select onchange="if(this.value) window.location='/download/{token}?secret={ADMIN_SECRET}&cell='+this.value"
+            <select onchange="if(this.value) window.location='/download/{token}?secret={ADMIN_SECRET}&cell='+this.value.padStart(2,'0')"
               style="font-size:.72rem;background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:4px;padding:.1rem .3rem;cursor:pointer">
               <option value="">⬇ Bunka...</option>
               {cell_options}
@@ -609,10 +609,12 @@ async def download_composer(token: str, secret: str = "", cell: str = ""):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         if cell:
-            cell_dir = os.path.join(composer_dir, f"cell{cell.zfill(2)}")
-            if os.path.exists(cell_dir):
-                for fname in sorted(os.listdir(cell_dir)):
-                    zf.write(os.path.join(cell_dir, fname), f"cell{cell.zfill(2)}/{fname}")
+        cell_dir = os.path.join(composer_dir, f"cell{cell.zfill(2)}")
+        if os.path.exists(cell_dir):
+            for fname in sorted(os.listdir(cell_dir)):
+                zf.write(os.path.join(cell_dir, fname), f"cell{cell.zfill(2)}/{fname}")
+        else:
+            return JSONResponse(status_code=404, content={"error": f"Bunka cell{cell.zfill(2)} nenájdená"})
         else:
             for cd in sorted(os.listdir(composer_dir)):
                 full = os.path.join(composer_dir, cd)
