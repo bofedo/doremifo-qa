@@ -293,6 +293,11 @@ async function upload(){{
     if(!res.ok) throw new Error(data.error||'Error');
     st.className='status ok';
     st.textContent=data.complete?T.done_all:T.done_part;
+    if(data.report_html) {{
+      const w=window.open('','_blank');
+      w.document.write(data.report_html);
+      w.document.close();
+    }}
     setTimeout(()=>window.location.reload(),2000);
   }}catch(e){{
     st.className='status err';st.textContent=T.error+': '+e.message;btn.disabled=false;
@@ -548,5 +553,44 @@ async def do_upload(
             f"*Varianty:* 10/10 ✅"
         )
 
-    return {"ok": True, "complete": complete,
-            "uploaded": uploaded_now, "total_cell": total_cell}
+    # Vygeneruj QA report ak máme VAR01 referenciu
+    report_html = None
+    ref_wav  = os.path.join(REFS_DIR, f"CELL{cell}_VAR01_{token}.wav")
+    ref_json = os.path.join(REFS_DIR, f"CELL{cell}_VAR01_{token}.json")
+
+    if os.path.exists(ref_wav) and os.path.exists(ref_json) and len(uploaded_now) > 0:
+        with tempfile.TemporaryDirectory() as tmp2:
+            w2 = os.path.join(tmp2, "wav")
+            j2 = os.path.join(tmp2, "json")
+            o2 = os.path.join(tmp2, "out")
+            os.makedirs(w2); os.makedirs(j2); os.makedirs(o2)
+
+            # Skopíruj všetky dostupné archivované súbory bunky
+            src_dir = os.path.join(ARCH_DIR, token, f"cell{cell}")
+            if os.path.exists(src_dir):
+                for fname in os.listdir(src_dir):
+                    if fname.endswith(".wav"):
+                        shutil.copy(os.path.join(src_dir, fname), os.path.join(w2, fname))
+                    elif fname.endswith(".json"):
+                        shutil.copy(os.path.join(src_dir, fname), os.path.join(j2, fname))
+
+            proc = subprocess.run([
+                "python3", "/app/analyze_cell.py",
+                "--cell", cell,
+                "--in",   j2,
+                "--wav",  w2,
+                "--out",  o2,
+            ], capture_output=True, text=True)
+
+            report_path = os.path.join(o2, f"cell{cell}_qa_report.html")
+            if os.path.exists(report_path):
+                with open(report_path) as f:
+                    report_html = f.read()
+
+    return {
+        "ok":          True,
+        "complete":    complete,
+        "uploaded":    uploaded_now,
+        "total_cell":  total_cell,
+        "report_html": report_html,
+    }
