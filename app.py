@@ -1,30 +1,32 @@
 """
-DoReMiFo QA — FastAPI backend v1.5
-- Skladateľ môže uploadovať ľubovoľnú bunku (1–10)
+DoReMiFo QA — FastAPI backend v1.6
+- Backblaze B2 pre WAV archív a referencie
+- SQLite lokálne (Railway ephemeral — reset pri redeploy)
+- Composer tokeny + unikátne upload linky
 - Progress tracking per skladateľ per bunka
 - Slack notifikácia pri každej kompletnej bunke
-- WAV archív per skladateľ
 - Admin dashboard s maticou buniek
 """
 
-import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re
+import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, urllib.request, urllib.parse, base64, hashlib
 from fastapi import FastAPI, File, UploadFile, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from typing import List
 
 app = FastAPI(title="DoReMiFo QA")
 
-DATA_DIR = "/app/data"
-REFS_DIR = os.path.join(DATA_DIR, "references")
-ARCH_DIR = os.path.join(DATA_DIR, "archive")
+DATA_DIR = "/tmp/doremifo"
 DB_PATH  = os.path.join(DATA_DIR, "doremifo.db")
-os.makedirs(REFS_DIR, exist_ok=True)
-os.makedirs(ARCH_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 SLACK_WEBHOOK = "https://hooks.slack.com/services/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"
 ADMIN_SECRET  = os.environ.get("ADMIN_SECRET", "doremifo-admin")
-VARS_ALL      = [f"VAR{i:02d}" for i in range(1, 11)]
-CELLS_ALL     = [f"{i:02d}" for i in range(1, 11)]
+B2_KEY_ID     = os.environ.get("B2_KEY_ID", "")
+B2_APP_KEY    = os.environ.get("B2_APP_KEY", "")
+B2_BUCKET     = os.environ.get("B2_BUCKET", "doremifo-qa")
+
+VARS_ALL  = [f"VAR{i:02d}" for i in range(1, 11)]
+CELLS_ALL = [f"{i:02d}" for i in range(1, 11)]
 
 CELL_NAMES = {
     "sk": {
@@ -38,6 +40,91 @@ CELL_NAMES = {
         "07":"Ascendant Gradation","08":"Descendent Relaxation","09":"Rupture","10":"Cadence"
     }
 }
+
+# ── B2 API ────────────────────────────────────────────────
+
+_b2_auth = None
+
+def b2_authorize():
+    global _b2_auth
+    if _b2_auth:
+        return _b2_auth
+    creds = base64.b64encode(f"{B2_KEY_ID}:{B2_APP_KEY}".encode()).decode()
+    req = urllib.request.Request(
+        "https://api.backblazeb2.com/b2api/v2/b2_authorize_account",
+        headers={"Authorization": f"Basic {creds}"}
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        _b2_auth = json.loads(r.read())
+    return _b2_auth
+
+def b2_get_upload_url():
+    auth = b2_authorize()
+    data = json.dumps({"bucketId": auth["allowed"]["bucketId"]}).encode()
+    req  = urllib.request.Request(
+        f"{auth['apiUrl']}/b2api/v2/b2_get_upload_url",
+        data=data,
+        headers={"Authorization": auth["authorizationToken"], "Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+def b2_upload(local_path: str, remote_name: str):
+    try:
+        upload_url = b2_get_upload_url()
+        with open(local_path, "rb") as f:
+            content = f.read()
+        sha1 = hashlib.sha1(content).hexdigest()
+        req = urllib.request.Request(
+            upload_url["uploadUrl"],
+            data=content,
+            headers={
+                "Authorization":     upload_url["authorizationToken"],
+                "X-Bz-File-Name":    urllib.parse.quote(remote_name),
+                "Content-Type":      "audio/wav" if remote_name.endswith(".wav") else "application/json",
+                "Content-Length":    str(len(content)),
+                "X-Bz-Content-Sha1": sha1,
+            }
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        print(f"B2 upload error: {e}")
+        return None
+
+def b2_download(remote_name: str, local_path: str) -> bool:
+    try:
+        global _b2_auth
+        _b2_auth = None
+        auth = b2_authorize()
+        url  = f"{auth['downloadUrl']}/file/{B2_BUCKET}/{urllib.parse.quote(remote_name)}"
+        req  = urllib.request.Request(url, headers={"Authorization": auth["authorizationToken"]})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            with open(local_path, "wb") as f:
+                f.write(r.read())
+        return True
+    except Exception as e:
+        print(f"B2 download error: {e}")
+        return False
+
+def b2_file_exists(remote_name: str) -> bool:
+    try:
+        auth = b2_authorize()
+        data = json.dumps({
+            "bucketId": auth["allowed"]["bucketId"],
+            "prefix":   remote_name,
+            "maxFileCount": 1
+        }).encode()
+        req = urllib.request.Request(
+            f"{auth['apiUrl']}/b2api/v2/b2_list_file_names",
+            data=data,
+            headers={"Authorization": auth["authorizationToken"], "Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            result = json.loads(r.read())
+        return any(f["fileName"] == remote_name for f in result.get("files", []))
+    except Exception:
+        return False
 
 # ── Databáza ──────────────────────────────────────────────
 
@@ -72,16 +159,12 @@ init_db()
 
 def slack_notify(msg: str):
     try:
-        subprocess.run([
-            "python3", "-c",
-            f"""
-import urllib.request, json
-data = json.dumps({{"text": {json.dumps(msg)}}}).encode()
-req = urllib.request.Request("{SLACK_WEBHOOK}",
-    data=data, headers={{"Content-Type":"application/json"}})
-urllib.request.urlopen(req, timeout=5)
-"""
-        ], timeout=8)
+        data = json.dumps({"text": msg}).encode()
+        req  = urllib.request.Request(
+            SLACK_WEBHOOK, data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=5)
     except Exception:
         pass
 
@@ -118,41 +201,28 @@ def build_upload_ui(composer_name: str, progress: dict, lang: str = "sk") -> str
         "sk": {
             "greeting": f"Ahoj, {composer_name}",
             "sub": "Vyber bunku a nahraj WAV súbory",
-            "cell_label": "Bunka",
-            "drop": "Pretiahni WAV súbory sem alebo klikni",
-            "hint": "CELL01_VAR01.wav … CELL01_VAR10.wav",
-            "btn": "Nahrať",
-            "processing": "Spracovávam...",
-            "done_all": "✅ Bunka kompletná! Výskumný tím bol notifikovaný.",
-            "done_part": "✅ Súbory nahrané.",
-            "error": "Chyba",
-            "progress_label": "Celkový progress",
+            "cell_label": "Bunka", "drop": "Pretiahni WAV súbory sem alebo klikni",
+            "hint": "CELL01_VAR01.wav … CELL01_VAR10.wav", "btn": "Nahrať",
+            "processing": "Spracovávam...", "done_all": "✅ Bunka kompletná! Výskumný tím bol notifikovaný.",
+            "done_part": "✅ Súbory nahrané.", "error": "Chyba", "progress_label": "Celkový progress",
         },
         "en": {
             "greeting": f"Hello, {composer_name}",
             "sub": "Select a cell and upload WAV files",
-            "cell_label": "Cell",
-            "drop": "Drag WAV files here or click",
-            "hint": "CELL01_VAR01.wav … CELL01_VAR10.wav",
-            "btn": "Upload",
-            "processing": "Processing...",
-            "done_all": "✅ Cell complete! The research team has been notified.",
-            "done_part": "✅ Files uploaded.",
-            "error": "Error",
-            "progress_label": "Overall progress",
+            "cell_label": "Cell", "drop": "Drag WAV files here or click",
+            "hint": "CELL01_VAR01.wav … CELL01_VAR10.wav", "btn": "Upload",
+            "processing": "Processing...", "done_all": "✅ Cell complete! The research team has been notified.",
+            "done_part": "✅ Files uploaded.", "error": "Error", "progress_label": "Overall progress",
         }
     }[lang]
 
-    # Celkový progress
     total_uploaded = sum(progress.values())
-    total_possible = 100
-    total_pct = round(total_uploaded / total_possible * 100)
+    total_pct      = round(total_uploaded / 100 * 100)
 
-    # Bunka grid
     cell_chips = ""
     for c in CELLS_ALL:
-        cnt = progress.get(c, 0)
-        pct = round(cnt / 10 * 100)
+        cnt   = progress.get(c, 0)
+        pct   = round(cnt / 10 * 100)
         color = "#22c55e" if cnt == 10 else "#6366f1" if cnt > 0 else "#334155"
         cell_chips += f"""<div class="cell-chip" onclick="selectCell('{c}')" id="cc{c}">
             <div class="cn">C{c}</div>
@@ -160,31 +230,17 @@ def build_upload_ui(composer_name: str, progress: dict, lang: str = "sk") -> str
             <div class="cbar-bg"><div class="cbar" style="width:{pct}%;background:{color}"></div></div>
         </div>"""
 
-    # VAR chips (začínajú prázdne, aktualizujú sa JS)
-    var_chips = ""
-    for v in VARS_ALL:
-        var_chips += f"""<div class="var-chip" id="vc{v}">
-            <div class="vn">{v.replace('VAR','V')}</div>
-            <div class="vi">○</div>
-        </div>"""
-
-    # Cell options
-    cell_options = ""
-    for c in CELLS_ALL:
-        name = CELL_NAMES[lang][c]
-        cell_options += f'<option value="{c}">{c} — {name}</option>'
+    var_chips = "".join(f"""<div class="var-chip" id="vc{v}">
+        <div class="vn">{v.replace('VAR','V')}</div><div class="vi">○</div>
+    </div>""" for v in VARS_ALL)
 
     return f"""<!DOCTYPE html>
-<html lang="{lang}">
-<head>
-<meta charset="UTF-8">
+<html lang="{lang}"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DoReMiFo QA</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-       background:#0f172a;color:#e2e8f0;min-height:100vh;
-       display:flex;align-items:flex-start;justify-content:center;padding:2rem}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:2rem}}
   .card{{background:#1e293b;border-radius:16px;padding:2.5rem;width:100%;max-width:560px;position:relative}}
   .lang{{position:absolute;top:1.5rem;right:1.5rem;display:flex;border-radius:8px;overflow:hidden;border:1px solid #334155}}
   .lang button{{padding:.3rem .7rem;background:transparent;color:#64748b;border:none;font-size:.78rem;font-weight:600;cursor:pointer}}
@@ -197,8 +253,7 @@ def build_upload_ui(composer_name: str, progress: dict, lang: str = "sk") -> str
   .prog-bg{{background:#0f172a;border-radius:99px;height:6px}}
   .prog-bar{{background:#6366f1;height:6px;border-radius:99px;transition:width .4s}}
   .cell-grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:.4rem;margin-bottom:1.5rem}}
-  .cell-chip{{background:#0f172a;border-radius:8px;padding:.5rem .3rem;text-align:center;
-              cursor:pointer;border:1px solid #1e293b;transition:border-color .15s}}
+  .cell-chip{{background:#0f172a;border-radius:8px;padding:.5rem .3rem;text-align:center;cursor:pointer;border:1px solid #1e293b;transition:border-color .15s}}
   .cell-chip:hover{{border-color:#6366f1}}
   .cell-chip.selected{{border-color:#6366f1;background:#1e2a4a}}
   .cn{{font-size:.78rem;font-weight:600}}
@@ -213,42 +268,31 @@ def build_upload_ui(composer_name: str, progress: dict, lang: str = "sk") -> str
   .var-chip.done{{background:#052e16;border-color:#14532d;color:#4ade80}}
   .vn{{font-size:.75rem;font-weight:600}}
   .vi{{font-size:.7rem;margin-top:.1rem;opacity:.8}}
-  .drop{{border:2px dashed #334155;border-radius:12px;padding:1.8rem;text-align:center;
-         color:#475569;font-size:.85rem;cursor:pointer;transition:border-color .2s,background .2s;margin-bottom:1rem}}
+  .drop{{border:2px dashed #334155;border-radius:12px;padding:1.8rem;text-align:center;color:#475569;font-size:.85rem;cursor:pointer;transition:border-color .2s,background .2s;margin-bottom:1rem}}
   .drop:hover,.drop.drag{{border-color:#6366f1;background:#1e2a4a;color:#a5b4fc}}
   .drop .icon{{font-size:1.6rem;margin-bottom:.4rem}}
   .drop .hint{{font-size:.72rem;color:#334155;margin-top:.3rem}}
-  button.run{{width:100%;padding:.7rem;background:#6366f1;color:white;border:none;
-              border-radius:8px;font-size:.92rem;font-weight:600;cursor:pointer;transition:background .2s}}
+  button.run{{width:100%;padding:.7rem;background:#6366f1;color:white;border:none;border-radius:8px;font-size:.92rem;font-weight:600;cursor:pointer;transition:background .2s}}
   button.run:hover:not(:disabled){{background:#4f46e5}}
   button.run:disabled{{background:#1e293b;color:#475569;cursor:not-allowed}}
   .status{{margin-top:1rem;padding:.65rem 1rem;border-radius:8px;font-size:.85rem;display:none}}
   .status.info{{background:#1e3a5f;color:#7dd3fc;display:block}}
   .status.ok{{background:#052e16;color:#86efac;display:block}}
   .status.err{{background:#450a0a;color:#fca5a5;display:block}}
-</style>
-</head>
-<body>
+</style></head><body>
 <div class="card">
   <div class="lang">
     <button class="{'active' if lang=='sk' else ''}" onclick="reload('sk')">SK</button>
     <button class="{'active' if lang=='en' else ''}" onclick="reload('en')">EN</button>
   </div>
-
   <h1>🎵 {t['greeting']}</h1>
   <p class="sub">{t['sub']}</p>
-
   <div class="total-progress">
-    <div class="prog-top">
-      <span>{t['progress_label']}</span>
-      <span>{total_uploaded} / 100</span>
-    </div>
+    <div class="prog-top"><span>{t['progress_label']}</span><span>{total_uploaded} / 100</span></div>
     <div class="prog-bg"><div class="prog-bar" style="width:{total_pct}%"></div></div>
   </div>
-
   <div class="section-label">{t['cell_label']}</div>
   <div class="cell-grid">{cell_chips}</div>
-
   <div class="upload-section" id="upload-section">
     <div class="selected-cell-title" id="cell-title"></div>
     <div class="var-grid">{var_chips}</div>
@@ -264,82 +308,59 @@ def build_upload_ui(composer_name: str, progress: dict, lang: str = "sk") -> str
     <div class="status" id="status"></div>
   </div>
 </div>
-
 <script>
 const PROGRESS   = {json.dumps(progress)};
 const CELL_NAMES = {json.dumps(CELL_NAMES[lang])};
 const T = {{
-  processing: "{t['processing']}",
-  done_all:   "{t['done_all']}",
-  done_part:  "{t['done_part']}",
-  error:      "{t['error']}",
+  processing:"{t['processing']}",done_all:"{t['done_all']}",
+  done_part:"{t['done_part']}",error:"{t['error']}",
 }};
 const VARS = {json.dumps(VARS_ALL)};
-
-let selectedCell = null;
-let files = {{}};
-
-function reload(l) {{ window.location.href = window.location.pathname + '?lang=' + l; }}
-function ev(e, on) {{ e.preventDefault(); document.getElementById('drop').classList.toggle('drag', on); }}
-function onDrop(e) {{ e.preventDefault(); document.getElementById('drop').classList.remove('drag'); onFiles(e.dataTransfer.files); }}
-
-function selectCell(cell) {{
-  selectedCell = cell;
-  document.querySelectorAll('.cell-chip').forEach(c => c.classList.remove('selected'));
-  document.getElementById('cc' + cell).classList.add('selected');
+let selectedCell = null, files = {{}};
+function reload(l){{window.location.href=window.location.pathname+'?lang='+l}}
+function ev(e,on){{e.preventDefault();document.getElementById('drop').classList.toggle('drag',on)}}
+function onDrop(e){{e.preventDefault();document.getElementById('drop').classList.remove('drag');onFiles(e.dataTransfer.files)}}
+function selectCell(cell){{
+  selectedCell=cell;
+  document.querySelectorAll('.cell-chip').forEach(c=>c.classList.remove('selected'));
+  document.getElementById('cc'+cell).classList.add('selected');
   document.getElementById('upload-section').classList.add('visible');
-  document.getElementById('cell-title').textContent = 'CELL' + cell + ' — ' + CELL_NAMES[cell];
-  files = {{}};
-  document.getElementById('btn').disabled = true;
-  updateVarChips(cell);
-}}
-
-function updateVarChips(cell) {{
-  const uploaded = PROGRESS[cell] || {{}};
-  VARS.forEach(v => {{
-    const chip = document.getElementById('vc' + v);
-    const done = uploaded[v] || false;
-    chip.className = 'var-chip' + (done ? ' done' : '');
-    chip.querySelector('.vi').textContent = done ? '✓' : '○';
+  document.getElementById('cell-title').textContent='CELL'+cell+' — '+CELL_NAMES[cell];
+  files={{}};document.getElementById('btn').disabled=true;
+  const uploaded=PROGRESS[cell]||{{}};
+  VARS.forEach(v=>{{
+    const chip=document.getElementById('vc'+v);
+    const done=uploaded[v]||false;
+    chip.className='var-chip'+(done?' done':'');
+    chip.querySelector('.vi').textContent=done?'✓':'○';
   }});
 }}
-
-function onFiles(f) {{
-  files = {{}};
-  Array.from(f).forEach(file => {{
-    const m = file.name.toUpperCase().match(/(VAR\d+)/);
-    if (m) files[m[1]] = file;
+function onFiles(f){{
+  files={{}};
+  Array.from(f).forEach(file=>{{
+    const m=file.name.toUpperCase().match(/(VAR\d+)/);
+    if(m) files[m[1]]=file;
   }});
-  document.getElementById('btn').disabled = Object.keys(files).length === 0;
+  document.getElementById('btn').disabled=Object.keys(files).length===0;
 }}
-
-async function upload() {{
-  const btn = document.getElementById('btn');
-  const st  = document.getElementById('status');
-  btn.disabled = true;
-  st.className = 'status info';
-  st.textContent = T.processing;
-
-  const fd = new FormData();
-  fd.append('cell', selectedCell);
-  Object.values(files).forEach(f => fd.append('wavs', f));
-
-  try {{
-    const res  = await fetch(window.location.pathname + '/upload', {{method:'POST', body:fd}});
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Error');
-    st.className = 'status ok';
-    st.textContent = data.complete ? T.done_all : T.done_part;
-    setTimeout(() => window.location.reload(), 2000);
-  }} catch(e) {{
-    st.className = 'status err';
-    st.textContent = T.error + ': ' + e.message;
-    btn.disabled = false;
+async function upload(){{
+  const btn=document.getElementById('btn'),st=document.getElementById('status');
+  btn.disabled=true;st.className='status info';st.textContent=T.processing;
+  const fd=new FormData();
+  fd.append('cell',selectedCell);
+  Object.values(files).forEach(f=>fd.append('wavs',f));
+  try{{
+    const res=await fetch(window.location.pathname+'/upload',{{method:'POST',body:fd}});
+    const data=await res.json();
+    if(!res.ok) throw new Error(data.error||'Error');
+    st.className='status ok';
+    st.textContent=data.complete?T.done_all:T.done_part;
+    setTimeout(()=>window.location.reload(),2000);
+  }}catch(e){{
+    st.className='status err';st.textContent=T.error+': '+e.message;btn.disabled=false;
   }}
 }}
-</script>
-</body>
-</html>"""
+</script></body></html>"""
 
 # ── Admin UI ──────────────────────────────────────────────
 
@@ -347,96 +368,77 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
     rows = ""
     for c in composers:
         token = c["token"]
-        name  = c["name"]
         cells_html = ""
         total = 0
         for cell in CELLS_ALL:
             cnt = progress_map.get(token, {}).get(cell, 0)
             total += cnt
             if cnt == 10:
-                cells_html += f'<td style="color:#4ade80;text-align:center;font-size:.8rem">✓</td>'
+                cells_html += '<td style="color:#4ade80;text-align:center;font-size:.8rem">✓</td>'
             elif cnt > 0:
                 cells_html += f'<td style="color:#a5b4fc;text-align:center;font-size:.8rem">{cnt}</td>'
             else:
-                cells_html += f'<td style="color:#334155;text-align:center;font-size:.8rem">—</td>'
+                cells_html += '<td style="color:#334155;text-align:center;font-size:.8rem">—</td>'
         pct = round(total / 100 * 100)
         rows += f"""<tr>
-          <td><strong>{name}</strong><br>
-            <span style="font-size:.72rem;color:#475569">{c['created_at'][:10]}</span>
-          </td>
+          <td><strong>{c['name']}</strong><br>
+            <span style="font-size:.72rem;color:#475569">{c['created_at'][:10]}</span></td>
           {cells_html}
           <td style="font-size:.8rem;color:#94a3b8">{total}/100<br>
             <div style="background:#0f172a;border-radius:99px;height:4px;margin-top:.3rem;width:80px">
               <div style="width:{pct}%;background:#6366f1;height:4px;border-radius:99px"></div>
-            </div>
-          </td>
+            </div></td>
           <td><code style="font-size:.72rem;color:#7dd3fc">/upload/{token}</code></td>
         </tr>"""
 
     cell_headers = "".join(f'<th style="text-align:center">C{c}</th>' for c in CELLS_ALL)
+    empty = f'<tr><td colspan="14" style="color:#475569;text-align:center;padding:2rem">Zatiaľ žiadni skladatelia</td></tr>'
 
     return f"""<!DOCTYPE html>
-<html lang="sk"><head><meta charset="UTF-8">
-<title>DoReMiFo Admin</title>
+<html lang="sk"><head><meta charset="UTF-8"><title>DoReMiFo Admin</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;padding:2rem}}
   h1{{font-size:1.4rem;color:#f1f5f9;margin-bottom:.3rem}}
   .meta{{color:#64748b;font-size:.82rem;margin-bottom:2rem}}
-  .new-form{{background:#1e293b;border-radius:12px;padding:1.5rem;margin-bottom:2rem;
-             display:flex;gap:.8rem;flex-wrap:wrap;align-items:flex-end}}
+  .new-form{{background:#1e293b;border-radius:12px;padding:1.5rem;margin-bottom:2rem;display:flex;gap:.8rem;flex-wrap:wrap;align-items:flex-end}}
   .new-form label{{font-size:.8rem;color:#94a3b8;display:block;margin-bottom:.3rem}}
-  .new-form input{{padding:.55rem .8rem;background:#0f172a;color:#e2e8f0;
-    border:1px solid #334155;border-radius:8px;font-size:.9rem}}
-  .new-form button{{padding:.55rem 1.2rem;background:#6366f1;color:white;border:none;
-    border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer}}
+  .new-form input{{padding:.55rem .8rem;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;font-size:.9rem}}
+  .new-form button{{padding:.55rem 1.2rem;background:#6366f1;color:white;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer}}
   .new-form button:hover{{background:#4f46e5}}
-  .result{{background:#052e16;color:#86efac;padding:.65rem 1rem;border-radius:8px;
-           font-size:.82rem;margin-bottom:1.5rem;display:none;word-break:break-all}}
+  .result{{background:#052e16;color:#86efac;padding:.65rem 1rem;border-radius:8px;font-size:.82rem;margin-bottom:1.5rem;display:none;word-break:break-all}}
   .tbl-wrap{{overflow-x:auto}}
   table{{width:100%;border-collapse:collapse;font-size:.85rem}}
-  th{{background:#1e293b;color:#94a3b8;text-align:left;padding:.6rem .8rem;
-      font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}}
+  th{{background:#1e293b;color:#94a3b8;text-align:left;padding:.6rem .8rem;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}}
   td{{padding:.6rem .8rem;border-bottom:1px solid #1e293b;vertical-align:middle}}
   tr:hover td{{background:#1e293b55}}
 </style></head><body>
 <h1>🎵 DoReMiFo Admin</h1>
 <div class="meta">Správa skladateľov · <a href="/admin?secret={ADMIN_SECRET}" style="color:#6366f1">Obnoviť</a></div>
-
 <div class="new-form">
-  <div>
-    <label>Meno skladateľa</label>
-    <input type="text" id="nm" placeholder="Jan Novak">
-  </div>
+  <div><label>Meno skladateľa</label><input type="text" id="nm" placeholder="Jan Novak"></div>
   <button onclick="newComposer()">Vygenerovať link</button>
 </div>
 <div class="result" id="result"></div>
-
 <div class="tbl-wrap">
-<table>
-  <thead><tr>
-    <th>Skladateľ</th>{cell_headers}<th>Celkom</th><th>Link</th>
-  </tr></thead>
-  <tbody>{rows if rows else f'<tr><td colspan="14" style="color:#475569;text-align:center;padding:2rem">Zatiaľ žiadni skladatelia</td></tr>'}</tbody>
-</table>
-</div>
-
+<table><thead><tr>
+  <th>Skladateľ</th>{cell_headers}<th>Celkom</th><th>Link</th>
+</tr></thead>
+<tbody>{rows if rows else empty}</tbody>
+</table></div>
 <script>
-async function newComposer() {{
-  const name = document.getElementById('nm').value.trim();
-  if (!name) return;
-  const res  = await fetch('/admin/new-composer', {{
-    method:'POST', headers:{{'Content-Type':'application/json'}},
-    body: JSON.stringify({{name}})
-  }});
-  const data = await res.json();
-  const el   = document.getElementById('result');
-  el.style.display = 'block';
-  el.textContent = '✅ Link: ' + window.location.origin + '/upload/' + data.token;
-  setTimeout(() => window.location.reload(), 3000);
+async function newComposer(){{
+  const name=document.getElementById('nm').value.trim();
+  if(!name) return;
+  const res=await fetch('/admin/new-composer',{{method:'POST',
+    headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name}})}});
+  const data=await res.json();
+  const el=document.getElementById('result');
+  el.style.display='block';
+  el.textContent='✅ Link: '+window.location.origin+'/upload/'+data.token;
+  setTimeout(()=>window.location.reload(),3000);
 }}
-</script>
-</body></html>"""
+</script></body></html>"""
 
 # ── Routes ────────────────────────────────────────────────
 
@@ -448,12 +450,10 @@ async def admin_ui(secret: str = ""):
         composers = [dict(r) for r in db.execute(
             "SELECT * FROM composers ORDER BY created_at DESC").fetchall()]
         uploads = db.execute("SELECT token, cell, var_id FROM uploads").fetchall()
-
     progress_map = {}
     for u in uploads:
         progress_map.setdefault(u["token"], {}).setdefault(u["cell"], 0)
         progress_map[u["token"]][u["cell"]] += 1
-
     return build_admin_ui(composers, progress_map)
 
 
@@ -476,12 +476,9 @@ async def upload_ui(token: str, lang: str = "sk"):
         if not c:
             return HTMLResponse("<h3 style='font-family:sans-serif;padding:2rem'>🔒 Neplatný link</h3>", status_code=404)
         rows = db.execute("SELECT cell, var_id FROM uploads WHERE token=?", (token,)).fetchall()
-
     progress = {}
     for r in rows:
         progress.setdefault(r["cell"], {})[r["var_id"]] = True
-
-    # Konvertuj na počty pre cell grid
     progress_counts = {cell: len(vars_) for cell, vars_ in progress.items()}
     return build_upload_ui(c["name"], progress_counts, lang)
 
@@ -492,10 +489,7 @@ async def do_upload(token: str, cell: str = Form(...), wavs: List[UploadFile] = 
         c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
         if not c:
             return JSONResponse(status_code=404, content={"error": "Neplatný token"})
-
     name = c["name"]
-    composer_dir = os.path.join(ARCH_DIR, token, f"cell{cell}")
-    os.makedirs(composer_dir, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as tmp:
         wav_dir  = os.path.join(tmp, "wav")
@@ -525,11 +519,15 @@ async def do_upload(token: str, cell: str = Form(...), wavs: List[UploadFile] = 
             subprocess.run(["essentia_streaming_extractor_music", wav_path, json_path],
                            capture_output=True)
 
-            shutil.copy(wav_path, os.path.join(composer_dir, wav_name))
+            # Upload do B2
+            b2_upload(wav_path,  f"archive/{token}/cell{cell}/{wav_name}")
+            if os.path.exists(json_path):
+                b2_upload(json_path, f"archive/{token}/cell{cell}/CELL{cell}_{var_id}.json")
 
+            # VAR01 → referencia v B2
             if var_id == "VAR01" and os.path.exists(json_path):
-                shutil.copy(wav_path,  os.path.join(REFS_DIR, f"CELL{cell}_VAR01_{token}.wav"))
-                shutil.copy(json_path, os.path.join(REFS_DIR, f"CELL{cell}_VAR01_{token}.json"))
+                b2_upload(wav_path,  f"references/CELL{cell}_VAR01_{token}.wav")
+                b2_upload(json_path, f"references/CELL{cell}_VAR01_{token}.json")
 
             source_sk = "Neznámy"
             if os.path.exists(json_path):
@@ -553,16 +551,39 @@ async def do_upload(token: str, cell: str = Form(...), wavs: List[UploadFile] = 
             f"🎵 *DoReMiFo QA* — bunka kompletná!\n"
             f"*Skladateľ:* {name}\n"
             f"*Bunka:* CELL{cell} — {CELL_NAMES['sk'][cell]}\n"
-            f"*Varianty:* 10/10 ✅"
+            f"*Varianty:* 10/10 ✅\n"
+            f"*Archív:* B2 → archive/{token}/cell{cell}/"
         )
 
     return {"ok": True, "complete": complete, "uploaded": uploaded_now, "total_cell": total_cell}
 
 
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return """<!DOCTYPE html>
+<html lang="sk"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DoReMiFo QA</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       background:#0f172a;color:#e2e8f0;min-height:100vh;
+       display:flex;align-items:center;justify-content:center;padding:2rem}
+  .card{background:#1e293b;border-radius:16px;padding:3rem 2.5rem;
+        width:100%;max-width:480px;text-align:center}
+  h1{font-size:1.6rem;color:#f1f5f9;margin-bottom:.5rem}
+  p{color:#64748b;font-size:.9rem;line-height:1.6;margin-bottom:2rem}
+  .note{font-size:.8rem;color:#334155;margin-top:2rem}
+</style></head><body>
+<div class="card">
+  <h1>🎵 DoReMiFo QA</h1>
+  <p>Platforma pre akustickú analýzu a QA<br>výskumného projektu DoReMiFo.</p>
+  <p>Ak si skladateľ, použi osobný link<br>ktorý si dostal od výskumného tímu.</p>
+  <div class="note">doremifo.com · app.doremifo.com</div>
+</div>
+</body></html>"""
+
+
 @app.get("/refs")
 async def list_refs():
-    saved = []
-    for cell in CELLS_ALL:
-        if any(f.startswith(f"CELL{cell}_VAR01_") for f in os.listdir(REFS_DIR)):
-            saved.append(cell)
-    return saved
+    return []
