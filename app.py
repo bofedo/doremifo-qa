@@ -614,8 +614,6 @@ async def download_composer(token: str, secret: str = "", cell: str = ""):
             for fname in sorted(os.listdir(cell_dir)):
                 zf.write(os.path.join(cell_dir, fname), f"cell{cell.zfill(2)}/{fname}")
         else:
-            return JSONResponse(status_code=404, content={"error": f"Bunka cell{cell.zfill(2)} nenájdená"})
-        else:
             for cd in sorted(os.listdir(composer_dir)):
                 full = os.path.join(composer_dir, cd)
                 if os.path.isdir(full):
