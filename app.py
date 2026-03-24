@@ -333,12 +333,12 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
             </div></td>
           <td>
             <code style="font-size:.72rem;color:#7dd3fc">/upload/{token}</code><br>
-            <a href="/admin/download/{token}?secret={ADMIN_SECRET}"
+            <a href="/download/{token}?secret={ADMIN_SECRET}"
                style="font-size:.72rem;color:#4ade80;text-decoration:none">
                ⬇ Všetko
             </a>
             &nbsp;
-            <select onchange="if(this.value) window.location='/admin/download/{token}?secret={ADMIN_SECRET}&cell='+this.value"
+            <select onchange="if(this.value) window.location='/download/{token}?secret={ADMIN_SECRET}&cell='+this.value"
               style="font-size:.72rem;background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:4px;padding:.1rem .3rem;cursor:pointer">
               <option value="">⬇ Bunka...</option>
               {''.join(f'<option value="{c}">{c}</option>' for c in CELLS_ALL)}
