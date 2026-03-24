@@ -1,12 +1,5 @@
 """
 DoReMiFo QA — FastAPI backend v1.8
-- Railway Volume pre perzistentné úložisko (/app/data)
-- Composer tokeny + unikátne upload linky
-- Progress tracking per skladateľ per bunka
-- Slack notifikácia pri každej kompletnej bunke
-- WAV archív per skladateľ
-- Admin dashboard s maticou buniek
-- Download endpoint pre stiahnutie súborov
 """
 
 import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io
@@ -562,7 +555,6 @@ async def do_upload(
             f"*Varianty:* 10/10 ✅"
         )
 
-    # Vygeneruj QA report
     report_html = None
     ref_wav  = os.path.join(REFS_DIR, f"CELL{cell}_VAR01_{token}.wav")
     ref_json = os.path.join(REFS_DIR, f"CELL{cell}_VAR01_{token}.json")
@@ -609,10 +601,10 @@ async def download_composer(token: str, secret: str = "", cell: str = ""):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         if cell:
-        cell_dir = os.path.join(composer_dir, f"cell{cell.zfill(2)}")
-        if os.path.exists(cell_dir):
-            for fname in sorted(os.listdir(cell_dir)):
-                zf.write(os.path.join(cell_dir, fname), f"cell{cell.zfill(2)}/{fname}")
+            cell_dir = os.path.join(composer_dir, f"cell{cell.zfill(2)}")
+            if os.path.exists(cell_dir):
+                for fname in sorted(os.listdir(cell_dir)):
+                    zf.write(os.path.join(cell_dir, fname), f"cell{cell.zfill(2)}/{fname}")
         else:
             for cd in sorted(os.listdir(composer_dir)):
                 full = os.path.join(composer_dir, cd)
