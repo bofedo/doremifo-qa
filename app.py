@@ -23,7 +23,7 @@ os.makedirs(REFS_DIR, exist_ok=True)
 os.makedirs(ARCH_DIR, exist_ok=True)
 
 SLACK_WEBHOOK = "https://hooks.slack.com/services/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"
-ADMIN_SECRET  = "DoReMiFo___2026___"
+ADMIN_SECRET  = os.environ.get("ADMIN_SECRET", "doremifo-admin")
 
 VARS_ALL  = [f"VAR{i:02d}" for i in range(1, 11)]
 CELLS_ALL = [f"{i:02d}" for i in range(1, 11)]
@@ -331,7 +331,19 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
             <div style="background:#0f172a;border-radius:99px;height:4px;margin-top:.3rem;width:80px">
               <div style="width:{pct}%;background:#6366f1;height:4px;border-radius:99px"></div>
             </div></td>
-          <td><code style="font-size:.72rem;color:#7dd3fc">/upload/{token}</code></td>
+          <td>
+            <code style="font-size:.72rem;color:#7dd3fc">/upload/{token}</code><br>
+            <a href="/admin/download/{token}?secret={ADMIN_SECRET}"
+               style="font-size:.72rem;color:#4ade80;text-decoration:none">
+               ⬇ Všetko
+            </a>
+            &nbsp;
+            <select onchange="if(this.value) window.location='/admin/download/{token}?secret={ADMIN_SECRET}&cell='+this.value"
+              style="font-size:.72rem;background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:4px;padding:.1rem .3rem;cursor:pointer">
+              <option value="">⬇ Bunka...</option>
+              {''.join(f'<option value="{c}">{c}</option>' for c in CELLS_ALL)}
+            </select>
+          </td>
         </tr>"""
 
     cell_headers = "".join(f'<th style="text-align:center">C{c}</th>' for c in CELLS_ALL)
