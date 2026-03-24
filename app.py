@@ -23,7 +23,7 @@ os.makedirs(REFS_DIR, exist_ok=True)
 os.makedirs(ARCH_DIR, exist_ok=True)
 
 SLACK_WEBHOOK = "https://hooks.slack.com/services/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"
-ADMIN_SECRET  = "DoReMiFo___2026___"
+ADMIN_SECRET  = os.environ.get("ADMIN_SECRET", "doremifo-admin")
 
 VARS_ALL  = [f"VAR{i:02d}" for i in range(1, 11)]
 CELLS_ALL = [f"{i:02d}" for i in range(1, 11)]
