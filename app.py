@@ -18,7 +18,7 @@ os.makedirs(REFS_DIR, exist_ok=True)
 
 # ── Detekcia zdroja ───────────────────────────────────────
 
-def detect_source(json_path: str) -> tuple[str, str, float]:
+def detect_source(json_path: str):
     """Vráti (label_sk, label_en, thresholds_scale)"""
     try:
         with open(json_path) as f:
