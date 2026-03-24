@@ -16,6 +16,9 @@ WORKDIR /app
 COPY analyze_cell.py .
 COPY app.py .
 
+# Persistent storage
+RUN mkdir -p /app/data/references /app/data/archive
+
 # Port
 EXPOSE 8000
 
