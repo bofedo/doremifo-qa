@@ -1,8 +1,9 @@
 """
-DoReMiFo QA — FastAPI backend
+DoReMiFo QA — FastAPI backend v1.1
 Endpoint: POST /qa
   - wav:    WAV súbor
   - cell:   číslo bunky (01–10)
+  - variant: VAR01–VAR10
   - source: typ zdroja (subtractive / fm / acoustic / sample)
 Vráti: HTML report
 """
@@ -10,11 +11,13 @@ Vráti: HTML report
 import os, shutil, subprocess, tempfile
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="DoReMiFo QA")
 
-# ── Jednoduchá upload stránka ─────────────────────────────
+# Perzistentný adresár pre VAR01 referencie (prežije medzi requestmi)
+REFS_DIR = "/app/references"
+os.makedirs(REFS_DIR, exist_ok=True)
+
 HTML_UI = """<!DOCTYPE html>
 <html lang="sk">
 <head>
@@ -61,6 +64,11 @@ HTML_UI = """<!DOCTYPE html>
   }
   .status.loading { background: #1e3a5f; color: #7dd3fc; display: block; }
   .status.error   { background: #450a0a; color: #fca5a5; display: block; }
+  .status.ok      { background: #052e16; color: #86efac; display: block; }
+  .refs { margin-top: 1.5rem; padding: 1rem; background: #0f172a; border-radius: 8px; }
+  .refs h3 { font-size: .8rem; color: #475569; margin-bottom: .5rem; text-transform: uppercase; letter-spacing: .05em; }
+  .ref-item { font-size: .82rem; color: #64748b; padding: .2rem 0; }
+  .ref-item.ok { color: #4ade80; }
 </style>
 </head>
 <body>
@@ -73,7 +81,7 @@ HTML_UI = """<!DOCTYPE html>
     <input type="file" id="wav" accept=".wav" required>
 
     <label>Bunka</label>
-    <select id="cell">
+    <select id="cell" onchange="checkRef()">
       <option value="01">01 — Stabilita / Konsonancia</option>
       <option value="02">02 — Introvertná statika</option>
       <option value="03">03 — Ascendentná energia</option>
@@ -88,7 +96,7 @@ HTML_UI = """<!DOCTYPE html>
 
     <label>Variant</label>
     <select id="variant">
-      <option value="VAR01">VAR01 — Základ</option>
+      <option value="VAR01">VAR01 — Základ (referencia)</option>
       <option value="VAR02">VAR02 — Attack ostrejší</option>
       <option value="VAR03">VAR03 — Attack mäkší</option>
       <option value="VAR04">VAR04 — Farba jasnejšia</option>
@@ -112,9 +120,26 @@ HTML_UI = """<!DOCTYPE html>
   </form>
 
   <div class="status" id="status"></div>
+
+  <div class="refs">
+    <h3>Uložené referencie VAR01</h3>
+    <div id="refs-list"><span class="ref-item">Načítavam...</span></div>
+  </div>
 </div>
 
 <script>
+async function checkRef() {
+  const res = await fetch('/refs');
+  const data = await res.json();
+  const el = document.getElementById('refs-list');
+  const cells = ['01','02','03','04','05','06','07','08','09','10'];
+  el.innerHTML = cells.map(c =>
+    `<div class="ref-item ${data.includes(c) ? 'ok' : ''}">
+      ${data.includes(c) ? '✓' : '○'} CELL${c} VAR01
+    </div>`
+  ).join('');
+}
+
 document.getElementById('form').onsubmit = async e => {
   e.preventDefault();
   const btn = document.getElementById('btn');
@@ -123,23 +148,31 @@ document.getElementById('form').onsubmit = async e => {
   if (!wav) return;
 
   btn.disabled = true;
+  const variant = document.getElementById('variant').value;
   status.className = 'status loading';
   status.textContent = '⏳ Spracovávam... (môže trvať 30–60 sekúnd)';
 
   const fd = new FormData();
   fd.append('wav', wav);
   fd.append('cell', document.getElementById('cell').value);
-  fd.append('variant', document.getElementById('variant').value);
+  fd.append('variant', variant);
   fd.append('source', document.getElementById('source').value);
 
   try {
     const res = await fetch('/qa', { method: 'POST', body: fd });
     if (!res.ok) throw new Error(await res.text());
-    const html = await res.text();
-    const w = window.open('', '_blank');
-    w.document.write(html);
-    w.document.close();
-    status.style.display = 'none';
+
+    if (variant === 'VAR01') {
+      status.className = 'status ok';
+      status.textContent = '✅ VAR01 referencia uložená. Teraz môžeš nahrať VAR02–VAR10.';
+      checkRef();
+    } else {
+      const html = await res.text();
+      const w = window.open('', '_blank');
+      w.document.write(html);
+      w.document.close();
+      status.style.display = 'none';
+    }
   } catch(err) {
     status.className = 'status error';
     status.textContent = '❌ Chyba: ' + err.message;
@@ -147,6 +180,8 @@ document.getElementById('form').onsubmit = async e => {
     btn.disabled = false;
   }
 };
+
+checkRef();
 </script>
 </body>
 </html>"""
@@ -155,6 +190,18 @@ document.getElementById('form').onsubmit = async e => {
 @app.get("/", response_class=HTMLResponse)
 async def ui():
     return HTML_UI
+
+
+@app.get("/refs")
+async def list_refs():
+    """Vráti zoznam buniek ktoré majú uloženú VAR01 referenciu."""
+    saved = []
+    for cell in [f"{i:02d}" for i in range(1, 11)]:
+        wav = os.path.join(REFS_DIR, f"CELL{cell}_VAR01.wav")
+        jsn = os.path.join(REFS_DIR, f"CELL{cell}_VAR01.json")
+        if os.path.exists(wav) and os.path.exists(jsn):
+            saved.append(cell)
+    return saved
 
 
 @app.post("/qa", response_class=HTMLResponse)
@@ -168,22 +215,24 @@ async def run_qa(
         wav_dir  = os.path.join(tmp, "wav")
         json_dir = os.path.join(tmp, "json")
         out_dir  = os.path.join(tmp, "out")
-        os.makedirs(wav_dir);  os.makedirs(json_dir);  os.makedirs(out_dir)
+        os.makedirs(wav_dir)
+        os.makedirs(json_dir)
+        os.makedirs(out_dir)
 
-        # Ulož WAV s DoReMiFo názvom
+        # Ulož nahratý WAV
         wav_name = f"CELL{cell}_{variant}.wav"
         wav_path = os.path.join(wav_dir, wav_name)
         with open(wav_path, "wb") as f:
             shutil.copyfileobj(wav.file, f)
 
-        # Normalizácia cez sox (stereo→mono, resample→44100)
+        # Normalizácia: stereo→mono, resample→44100, 24-bit
         norm_path = wav_path.replace(".wav", "_norm.wav")
         subprocess.run([
             "sox", wav_path, "-r", "44100", "-c", "1", "-b", "24", norm_path
         ], check=True)
         os.replace(norm_path, wav_path)
 
-        # Essentia extrakcia
+        # Essentia extrakcia nahratého súboru
         json_path = os.path.join(json_dir, f"CELL{cell}_{variant}.json")
         result = subprocess.run([
             "essentia_streaming_extractor_music",
@@ -196,19 +245,40 @@ async def run_qa(
                 content={"error": "Essentia extrakcia zlyhala", "detail": result.stderr.decode()}
             )
 
+        # Ak je to VAR01 — ulož ako referenciu a skonči
+        if variant == "VAR01":
+            shutil.copy(wav_path,  os.path.join(REFS_DIR, wav_name))
+            shutil.copy(json_path, os.path.join(REFS_DIR, f"CELL{cell}_VAR01.json"))
+            return HTMLResponse(content="VAR01 uložená")
+
+        # Pre VAR02–VAR10 — skopíruj VAR01 referenciu do tmp
+        ref_wav  = os.path.join(REFS_DIR, f"CELL{cell}_VAR01.wav")
+        ref_json = os.path.join(REFS_DIR, f"CELL{cell}_VAR01.json")
+
+        if not os.path.exists(ref_wav) or not os.path.exists(ref_json):
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Chýba VAR01 referencia pre CELL{cell}. Najprv nahraj VAR01."}
+            )
+
+        shutil.copy(ref_wav,  os.path.join(wav_dir,  f"CELL{cell}_VAR01.wav"))
+        shutil.copy(ref_json, os.path.join(json_dir, f"CELL{cell}_VAR01.json"))
+
         # QA analýza
-        subprocess.run([
+        proc = subprocess.run([
             "python3", "/app/analyze_cell.py",
             "--cell", cell,
             "--in",   json_dir,
             "--wav",  wav_dir,
             "--out",  out_dir,
-        ], check=True)
+        ], capture_output=True, text=True)
 
-        # Vráť HTML report
         report = os.path.join(out_dir, f"cell{cell}_qa_report.html")
         if not os.path.exists(report):
-            return JSONResponse(status_code=500, content={"error": "Report nebol vygenerovaný"})
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Report nebol vygenerovaný", "detail": proc.stderr}
+            )
 
         with open(report) as f:
             return HTMLResponse(content=f.read())
