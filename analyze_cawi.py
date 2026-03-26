@@ -239,26 +239,39 @@ def mds_analysis(df: pd.DataFrame) -> dict:
     scaler = StandardScaler()
     X = scaler.fit_transform(agg)
 
-    # Euklidovská dissimilarity matica
-    dist_matrix = squareform(pdist(X, metric='euclidean'))
+    # Euklidovská dissimilarity matica — normalizovaná na 0–1
+    dist_raw = squareform(pdist(X, metric='euclidean'))
+    max_d = dist_raw.max()
+    dist_matrix = dist_raw / max_d if max_d > 0 else dist_raw
 
     # MDS 2D
-    mds2 = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+    mds2 = MDS(n_components=2, dissimilarity='precomputed', random_state=42, max_iter=500, n_init=4)
     coords2 = mds2.fit_transform(dist_matrix)
+    # Normalizuj súradnice na -1..1 pre vizualizáciu
+    for i in range(2):
+        r = np.abs(coords2[:, i]).max()
+        if r > 0: coords2[:, i] /= r
 
     # MDS 3D
-    mds3 = MDS(n_components=3, dissimilarity='precomputed', random_state=42)
+    mds3 = MDS(n_components=3, dissimilarity='precomputed', random_state=42, max_iter=500, n_init=4)
     coords3 = mds3.fit_transform(dist_matrix)
+    for i in range(3):
+        r = np.abs(coords3[:, i]).max()
+        if r > 0: coords3[:, i] /= r
+
+    # Normalized stress (Kruskal's stress-1)
+    stress_2d = round(float(np.sqrt(mds2.stress_ / np.sum(dist_matrix**2))), 4)
+    stress_3d = round(float(np.sqrt(mds3.stress_ / np.sum(dist_matrix**2))), 4)
 
     results = {
         'variants': list(agg.index),
         'mds_2d': coords2.round(4).tolist(),
         'mds_3d': coords3.round(4).tolist(),
-        'stress_2d': round(float(mds2.stress_), 4),
-        'stress_3d': round(float(mds3.stress_), 4),
+        'stress_2d': stress_2d,
+        'stress_3d': stress_3d,
         'dist_matrix': dist_matrix.round(4).tolist(),
     }
-    print(f"  MDS stress 2D: {results['stress_2d']}, 3D: {results['stress_3d']}")
+    print(f"  MDS stress 2D: {stress_2d}, 3D: {stress_3d}")
     return results
 
 
@@ -284,10 +297,12 @@ def regression_models(df: pd.DataFrame) -> dict:
 
     # H1–H3: var_num → sémantické diferenciály + Valence + Arousal
     targets_h1h3 = {
-        'dark_bright': 'Timbre contour → Bright/Dark (H1)',
-        'soft_hard':   'Attack → Soft/Hard (H2)',
-        'smooth_rough':'Dissonance → Smooth/Rough (H3)',
+        'dark_bright':    'Timbre contour → Bright/Dark (H1)',
+        'soft_hard':      'Attack → Soft/Hard (H2)',
+        'smooth_rough':   'Dissonance → Smooth/Rough (H3)',
         'simple_complex': 'Density → Simple/Complex (H3)',
+        'valence':        'Timbre → Valence (H1)',
+        'arousal':        'Density → Arousal (H3)',
     }
 
     h1h3_results = {}
@@ -483,11 +498,13 @@ def build_html_report(results: dict) -> str:
 
     mds_points = ''
     if mds.get('mds_2d') and mds.get('variants'):
-        for i,(v,c) in enumerate(zip(mds['variants'], mds['mds_2d'])):
-            x = round((c[0]+3)*60+80, 1)
-            y = round((c[1]+3)*40+60, 1)
+        # Súradnice sú normalizované -1..1, mapujeme na SVG priestor 80..420 x 40..260
+        for i, (v, c) in enumerate(zip(mds['variants'], mds['mds_2d'])):
+            x = round(80 + (c[0] + 1) / 2 * 340, 1)
+            y = round(40 + (c[1] + 1) / 2 * 220, 1)
             cell_num = v.split('_')[0]
-            mds_points += f'<circle cx="{x}" cy="{y}" r="5" fill="#6366f1" opacity=".7"/><text x="{x+7}" y="{y+4}" font-size="9" fill="#94a3b8">{v}</text>'
+            color = f'hsl({int(cell_num)*36},70%,60%)'
+            mds_points += f'<circle cx="{x}" cy="{y}" r="4" fill="{color}" opacity=".8"/><text x="{x+6}" y="{y+4}" font-size="8" fill="#94a3b8">{v}</text>'
 
     h1h3_rows = ''
     for k,v in reg.get('h1h3',{}).items():
