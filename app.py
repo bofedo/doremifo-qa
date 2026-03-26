@@ -6,9 +6,17 @@ DoReMiFo QA — FastAPI backend v1.9
 import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv
 from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 
 app = FastAPI(title="DoReMiFo QA")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://study.doremifo.com", "http://localhost"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 DATA_DIR = "/app/data"
 REFS_DIR = os.path.join(DATA_DIR, "references")
