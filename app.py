@@ -811,22 +811,48 @@ async def response_stats(secret: str = ""):
     }
 
 
-@app.post("/analysis/run")
-async def run_analysis(secret: str = "", simulate: bool = False):
-    """Spustí analytický pipeline na dátach z DB."""
-    if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+import threading
+
+analysis_status = {"running": False, "last_run": None, "error": None}
+
+def _run_pipeline_bg(simulate: bool):
+    global analysis_status
+    analysis_status["running"] = True
+    analysis_status["error"] = None
     try:
-        import sys
+        import sys, importlib
         sys.path.insert(0, '/app')
-        from analyze_cawi import run_pipeline
+        mod = importlib.import_module("analyze_cawi")
         out_dir = os.path.join(DATA_DIR, "analysis")
         db = None if simulate else DB_PATH
-        results = run_pipeline(db_path=db, out_dir=out_dir, simulate=simulate)
-        return {"ok": True, "generated_at": results.get("generated_at"),
-                "report_url": f"/analysis/report?secret={secret}"}
+        results = mod.run_pipeline(db_path=db, out_dir=out_dir, simulate=simulate)
+        analysis_status["last_run"] = results.get("generated_at")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        analysis_status["error"] = traceback.format_exc()
+    finally:
+        analysis_status["running"] = False
+
+@app.post("/analysis/run")
+async def run_analysis(secret: str = "", simulate: bool = False):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+    if analysis_status["running"]:
+        return {"ok": False, "message": "Pipeline already running"}
+    t = threading.Thread(target=_run_pipeline_bg, args=(simulate,), daemon=True)
+    t.start()
+    return {"ok": True, "message": "Pipeline started in background. Check /analysis/status for progress."}
+
+@app.get("/analysis/status")
+async def analysis_status_endpoint(secret: str = ""):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+    return {
+        "running": analysis_status["running"],
+        "last_run": analysis_status["last_run"],
+        "error": analysis_status["error"],
+        "report_ready": os.path.exists(os.path.join(DATA_DIR, "analysis", "sonic_atoms_report.html")),
+    }
 
 
 @app.get("/analysis/report")
