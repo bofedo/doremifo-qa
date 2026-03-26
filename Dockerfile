@@ -1,6 +1,5 @@
 FROM ghcr.io/mtg/essentia:latest
 
-# Python závislosti
 RUN apt-get update && apt-get install -y \
     python3-pip \
     sox \
@@ -9,17 +8,21 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 install --no-cache-dir \
     fastapi \
     uvicorn \
-    python-multipart
+    python-multipart \
+    numpy \
+    pandas \
+    scipy \
+    scikit-learn \
+    statsmodels \
+    pingouin
 
-# Kód
 WORKDIR /app
 COPY analyze_cell.py .
+COPY analyze_cawi.py .
 COPY app.py .
 
-# Persistent storage
-RUN mkdir -p /app/data/references /app/data/archive
+RUN mkdir -p /app/data/references /app/data/archive /app/data/analysis
 
-# Port
 EXPOSE 8000
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
