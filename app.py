@@ -1,9 +1,10 @@
 """
-DoReMiFo QA — FastAPI backend v1.8
+DoReMiFo QA — FastAPI backend v1.9
++ CAWI response storage
 """
 
-import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io
-from fastapi import FastAPI, File, UploadFile, Form, Request
+import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv
+from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from typing import List
 
@@ -60,6 +61,45 @@ def init_db():
                 source      TEXT,
                 uploaded_at TEXT DEFAULT (datetime('now')),
                 UNIQUE(token, cell, var_id)
+            )""")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS cawi_responses (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                prolific_pid TEXT,
+                study_id     TEXT,
+                session_id   TEXT,
+                source       TEXT DEFAULT 'prolific',
+                sensitivity  INTEGER,
+                headphone_flag INTEGER DEFAULT 0,
+                attention_flag INTEGER DEFAULT 0,
+                hard_flag    INTEGER DEFAULT 0,
+                duplicate_delta_valence REAL,
+                duplicate_delta_arousal REAL,
+                completed_at TEXT,
+                raw_json     TEXT,
+                created_at   TEXT DEFAULT (datetime('now'))
+            )""")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS cawi_atoms (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                response_id     INTEGER NOT NULL,
+                prolific_pid    TEXT,
+                source          TEXT,
+                atom_index      INTEGER,
+                cell            TEXT,
+                var             TEXT,
+                is_duplicate    INTEGER DEFAULT 0,
+                valence         INTEGER,
+                arousal         INTEGER,
+                trustworthiness INTEGER,
+                action_urge     INTEGER,
+                distinctiveness INTEGER,
+                attribute       TEXT,
+                confidence      INTEGER,
+                ux_affordance   TEXT,
+                sem_diff        TEXT,
+                timestamp       INTEGER,
+                FOREIGN KEY (response_id) REFERENCES cawi_responses(id)
             )""")
 
 init_db()
@@ -369,7 +409,9 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
 </style></head><body>
 <h1>🎵 DoReMiFo Admin</h1>
 <div class="meta">Správa skladateľov ·
-  <a href="/admin?secret={ADMIN_SECRET}" style="color:#6366f1">Obnoviť</a>
+  <a href="/admin?secret={ADMIN_SECRET}" style="color:#6366f1">Obnoviť</a> ·
+  <a href="/responses/stats?secret={ADMIN_SECRET}" style="color:#a5b4fc">📊 CAWI stats</a> ·
+  <a href="/responses/export?secret={ADMIN_SECRET}" style="color:#4ade80">⬇ Export CSV</a>
 </div>
 <div class="new-form">
   <div><label>Meno skladateľa</label>
@@ -618,6 +660,147 @@ async def download_composer(token: str, secret: str = "", cell: str = ""):
     return StreamingResponse(
         buf, media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=doremifo_{name}{suffix}.zip"})
+
+
+# ── CAWI Response Storage ─────────────────────────────────
+
+@app.post("/responses")
+async def save_response(req: Request):
+    """Prijme kompletné dáta z jsPsych frontendu."""
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    pid        = data.get("prolific_pid", "")
+    study_id   = data.get("study_id", "")
+    session_id = data.get("session_id", "")
+    source     = data.get("source", "prolific")
+
+    with get_db() as db:
+        cur = db.execute("""
+            INSERT INTO cawi_responses
+            (prolific_pid, study_id, session_id, source, sensitivity,
+             headphone_flag, attention_flag, hard_flag,
+             duplicate_delta_valence, duplicate_delta_arousal,
+             completed_at, raw_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
+            pid, study_id, session_id, source,
+            data.get("sensitivity"),
+            int(data.get("headphone_flag", False)),
+            int(data.get("attention_flag", False)),
+            int(data.get("hard_flag", False)),
+            data.get("duplicate_delta_valence"),
+            data.get("duplicate_delta_arousal"),
+            data.get("completed_at"),
+            json.dumps(data),
+        ))
+        response_id = cur.lastrowid
+
+        for atom in data.get("responses", []):
+            sem = atom.get("sem_diff", {})
+            db.execute("""
+                INSERT INTO cawi_atoms
+                (response_id, prolific_pid, source, atom_index, cell, var,
+                 is_duplicate, valence, arousal, trustworthiness,
+                 action_urge, distinctiveness, attribute, confidence,
+                 ux_affordance, sem_diff, timestamp)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                response_id, pid, source,
+                atom.get("atom_index"),
+                atom.get("cell"),
+                atom.get("var"),
+                int(atom.get("is_duplicate", False)),
+                atom.get("valence"),
+                atom.get("arousal"),
+                atom.get("trustworthiness"),
+                atom.get("action_urge"),
+                atom.get("distinctiveness"),
+                atom.get("attribute"),
+                atom.get("confidence"),
+                atom.get("ux_affordance"),
+                json.dumps(sem),
+                atom.get("timestamp"),
+            ))
+
+    slack_notify(
+        f"🎵 *Sonic Atoms* — nová odpoveď!\n"
+        f"*PID:* {pid}\n"
+        f"*Zdroj:* {source}\n"
+        f"*Atómov:* {len(data.get('responses', []))}"
+    )
+
+    return {"ok": True, "response_id": response_id}
+
+
+@app.get("/responses/export")
+async def export_responses(secret: str = "", fmt: str = "csv"):
+    """Export všetkých CAWI dát ako CSV."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+
+    with get_db() as db:
+        atoms = db.execute("""
+            SELECT
+                r.prolific_pid, r.study_id, r.session_id, r.source,
+                r.sensitivity, r.headphone_flag, r.attention_flag,
+                r.hard_flag, r.duplicate_delta_valence,
+                r.duplicate_delta_arousal, r.completed_at,
+                a.atom_index, a.cell, a.var, a.is_duplicate,
+                a.valence, a.arousal, a.trustworthiness,
+                a.action_urge, a.distinctiveness,
+                a.attribute, a.confidence, a.ux_affordance, a.sem_diff
+            FROM cawi_atoms a
+            JOIN cawi_responses r ON r.id = a.response_id
+            ORDER BY r.id, a.atom_index
+        """).fetchall()
+
+    if fmt == "json":
+        return JSONResponse([dict(a) for a in atoms])
+
+    buf = io.StringIO()
+    if atoms:
+        w = csv.DictWriter(buf, fieldnames=atoms[0].keys())
+        w.writeheader()
+        w.writerows([dict(a) for a in atoms])
+
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue().encode()),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=sonic_atoms_responses.csv"}
+    )
+
+
+@app.get("/responses/stats")
+async def response_stats(secret: str = ""):
+    """Rýchly prehľad zberu dát."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+
+    with get_db() as db:
+        total    = db.execute("SELECT COUNT(*) FROM cawi_responses").fetchone()[0]
+        prolific = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE source='prolific'").fetchone()[0]
+        social   = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE source='social'").fetchone()[0]
+        atoms    = db.execute("SELECT COUNT(*) FROM cawi_atoms WHERE is_duplicate=0").fetchone()[0]
+        flagged  = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE hard_flag=1").fetchone()[0]
+        coverage = db.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT cell, var, COUNT(*) as n
+                FROM cawi_atoms
+                WHERE is_duplicate=0
+                GROUP BY cell, var
+                HAVING n >= 30
+            )
+        """).fetchone()[0]
+
+    return {
+        "total_responses":    total,
+        "prolific":           prolific,
+        "social":             social,
+        "total_atom_ratings": atoms,
+        "hard_flagged":       flagged,
+        "variants_coverage":  f"{coverage}/100",
+    }
 
 
 @app.get("/refs")
