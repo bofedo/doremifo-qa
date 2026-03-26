@@ -9,12 +9,12 @@ RUN pip3 install --no-cache-dir \
     fastapi \
     uvicorn \
     python-multipart \
-    numpy \
-    pandas \
-    scipy \
-    scikit-learn \
-    statsmodels \
-    pingouin
+    "numpy==1.19.5" \
+    "pandas==1.1.5" \
+    "scipy==1.5.4" \
+    "scikit-learn==0.24.2" \
+    "statsmodels==0.12.2" \
+    "pingouin==0.3.12"
 
 WORKDIR /app
 COPY analyze_cell.py .
