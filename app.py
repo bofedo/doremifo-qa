@@ -811,6 +811,48 @@ async def response_stats(secret: str = ""):
     }
 
 
+@app.post("/analysis/run")
+async def run_analysis(secret: str = "", simulate: bool = False):
+    """Spustí analytický pipeline na dátach z DB."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+    try:
+        import sys
+        sys.path.insert(0, '/app')
+        from analyze_cawi import run_pipeline
+        out_dir = os.path.join(DATA_DIR, "analysis")
+        db = None if simulate else DB_PATH
+        results = run_pipeline(db_path=db, out_dir=out_dir, simulate=simulate)
+        return {"ok": True, "generated_at": results.get("generated_at"),
+                "report_url": f"/analysis/report?secret={secret}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analysis/report")
+async def analysis_report(secret: str = ""):
+    """Zobrazí HTML report poslednej analýzy."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+    report_path = os.path.join(DATA_DIR, "analysis", "sonic_atoms_report.html")
+    if not os.path.exists(report_path):
+        return HTMLResponse("<h3 style='font-family:sans-serif;padding:2rem'>⚠️ Report nenájdený. Spusti /analysis/run najprv.</h3>")
+    with open(report_path) as f:
+        return HTMLResponse(f.read())
+
+
+@app.get("/analysis/json")
+async def analysis_json(secret: str = ""):
+    """Vráti JSON výsledky poslednej analýzy."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+    json_path = os.path.join(DATA_DIR, "analysis", "sonic_atoms_analysis.json")
+    if not os.path.exists(json_path):
+        raise HTTPException(status_code=404, detail="JSON nenájdený. Spusti /analysis/run najprv.")
+    with open(json_path) as f:
+        return JSONResponse(json.load(f))
+
+
 @app.get("/refs")
 async def list_refs():
     return []
