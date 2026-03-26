@@ -243,11 +243,11 @@ def mds_analysis(df: pd.DataFrame) -> dict:
     dist_matrix = squareform(pdist(X, metric='euclidean'))
 
     # MDS 2D
-    mds2 = MDS(n_components=2, dissimilarity='precomputed', random_state=42, normalized_stress='auto')
+    mds2 = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
     coords2 = mds2.fit_transform(dist_matrix)
 
     # MDS 3D
-    mds3 = MDS(n_components=3, dissimilarity='precomputed', random_state=42, normalized_stress='auto')
+    mds3 = MDS(n_components=3, dissimilarity='precomputed', random_state=42)
     coords3 = mds3.fit_transform(dist_matrix)
 
     results = {
