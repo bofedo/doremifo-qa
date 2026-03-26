@@ -142,8 +142,8 @@ def descriptive_stats(df: pd.DataFrame) -> dict:
     # Per-cell means
     cell_means = df.groupby('cell')[PRIMARY_SCALES].mean().round(3)
     cell_std   = df.groupby('cell')[PRIMARY_SCALES].std().round(3)
-    stats_out['cell_means'] = cell_means.to_dict()
-    stats_out['cell_std']   = cell_std.to_dict()
+    stats_out['cell_means'] = {str(k): v for k, v in cell_means.to_dict().items()}
+    stats_out['cell_std']   = {str(k): v for k, v in cell_std.to_dict().items()}
     # Coverage
     coverage = df.groupby('cell_var').size()
     stats_out['coverage_min'] = int(coverage.min())
@@ -401,6 +401,7 @@ def moderation_analysis(df: pd.DataFrame) -> dict:
     # H12: Headphone type → effect sizes (exploratórne)
     if 'headphones' in df.columns:
         hp_groups = df.groupby('headphones')[PRIMARY_SCALES].agg(['mean','std'])
+        hp_groups.columns = ['_'.join(col) for col in hp_groups.columns]
         results['h12_headphone_means'] = hp_groups.round(3).to_dict()
         # Cohen's d medzi over_ear a in_ear_wireless
         for scale in ['valence', 'arousal']:
