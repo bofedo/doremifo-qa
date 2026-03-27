@@ -394,10 +394,10 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
             </div></td>
           <td>
             <code style="font-size:.72rem;color:#7dd3fc">/upload/{token}</code><br>
-            <a href="/download/{token}?secret={ADMIN_SECRET}"
+            <a href="/download/{token}"
                style="font-size:.72rem;color:#4ade80;text-decoration:none">⬇ Všetko</a>
             &nbsp;
-            <select onchange="if(this.value) window.location='/download/{token}?secret={ADMIN_SECRET}&cell='+this.value.padStart(2,'0')"
+            <select onchange="if(this.value) window.location='/download/{token}?cell='+this.value.padStart(2,'0')"
               style="font-size:.72rem;background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:4px;padding:.1rem .3rem;cursor:pointer">
               <option value="">⬇ Bunka...</option>
               {cell_options}
@@ -434,9 +434,9 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
 </style></head><body>
 <h1>🎵 DoReMiFo Admin</h1>
 <div class="meta">Správa skladateľov ·
-  <a href="/admin?secret={ADMIN_SECRET}" style="color:#6366f1">Obnoviť</a> ·
-  <a href="/responses/stats?secret={ADMIN_SECRET}" style="color:#a5b4fc">📊 CAWI stats</a> ·
-  <a href="/responses/export?secret={ADMIN_SECRET}" style="color:#4ade80">⬇ Export CSV</a>
+  <a href="/admin" style="color:#6366f1">Obnoviť</a> ·
+  <a href="/responses/stats" style="color:#a5b4fc">📊 CAWI stats</a> ·
+  <a href="/responses/export" style="color:#4ade80">⬇ Export CSV</a>
 </div>
 <div class="new-form">
   <div><label>Meno skladateľa</label>
