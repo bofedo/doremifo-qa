@@ -27,4 +27,5 @@ RUN mkdir -p /app/data/references /app/data/archive /app/data/analysis
 
 EXPOSE 8000
 
+ENTRYPOINT []
 CMD ["./entrypoint.sh"]
