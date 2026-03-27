@@ -31,8 +31,8 @@ SLACK_WEBHOOK = "https://hooks.slack.com/services/TDR6LBBR6/B0APAPC2HRN/mMWQa8xw
 
 # ── HTTP Basic Auth ───────────────────────────────────────
 security   = HTTPBasic()
-ADMIN_USER = os.environ.get("ADMIN_USER", "")
-ADMIN_PASS = os.environ.get("ADMIN_PASSWORD", "")
+ADMIN_USER = os.environ.get("DRF_ADMIN_USER", "")
+ADMIN_PASS = os.environ.get("DRF_ADMIN_PASSWORD", "")
 
 def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if not ADMIN_USER or not ADMIN_PASS:
