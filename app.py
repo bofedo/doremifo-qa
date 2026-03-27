@@ -15,11 +15,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import List
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-
-limiter = Limiter(key_func=get_remote_address)
+import time
+from collections import defaultdict
 
 app = FastAPI(
     title="DoReMiFo QA",
@@ -28,8 +25,18 @@ app = FastAPI(
     redoc_url=None,
 )
 
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# ── Rate limiter (bez externých knižníc) ──────────────────
+_rate_store: dict = defaultdict(list)
+_rate_lock = threading.Lock()
+
+def check_rate_limit(ip: str, limit: int = 20, window: int = 60):
+    now = time.time()
+    with _rate_lock:
+        calls = [t for t in _rate_store[ip] if now - t < window]
+        if len(calls) >= limit:
+            raise HTTPException(status_code=429, detail="Too many requests")
+        calls.append(now)
+        _rate_store[ip] = calls
 
 app.add_middleware(
     CORSMiddleware,
@@ -697,8 +704,9 @@ async def download_composer(token: str, cell: str = "", admin=Depends(require_ad
 # ── CAWI Response Storage ─────────────────────────────────
 
 @app.post("/responses")
-@limiter.limit("20/minute")
 async def save_response(req: Request):
+    ip = req.client.host if req.client else "unknown"
+    check_rate_limit(ip)
     try:
         data = await req.json()
     except Exception:
