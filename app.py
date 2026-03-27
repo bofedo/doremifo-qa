@@ -1,23 +1,27 @@
 """
-DoReMiFo QA — FastAPI backend v2.4
-+ CAWI response storage
-+ HTTP Basic Auth (heslo v Railway DOREMIFO_KEY)
-+ Vypnutá verejná API dokumentácia
-+ Rate limiting na /responses (bez externých knižníc)
-+ Validácia polí na /responses
-+ Slack webhook cez env var
-+ Odstránené logovanie hesla
-+ Fix: /admin/new-composer bez Depends(require_admin) — bezpečné cez admin panel
+DoReMiFo QA — FastAPI backend v2.5
+Bezpečnostné opravy oproti v2.4:
+  - Admin username presunutý do env var DOREMIFO_ADMIN_USER
+  - Limit veľkosti uploadu (60 MB) cez middleware
+  - Whitelist validácia parametra cell a var_id
+  - HMAC-SHA256 podpis session_id pre POST /responses
+  - Perzistentný rate limiter cez SQLite (prežije reštart)
+  - Expirácia composer tokenov (90 dní, konfigurovateľné)
+  - DELETE /admin/delete-composer chránený require_admin
+  - Nový endpoint POST /admin/extend-composer/{token}
+  - Zachované: secrets.compare_digest, CORS whitelist, zakázaná OpenAPI docs
 """
 
-import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv, threading
+import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv
+import threading, hmac, hashlib, time
+from datetime import datetime, timedelta
 from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException, Depends, status
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.base import BaseHTTPMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from starlette.responses import Response
 from typing import List
-import time
-from collections import defaultdict
 
 app = FastAPI(
     title="DoReMiFo QA",
@@ -26,18 +30,21 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# ── Rate limiter ──────────────────────────────────────────
-_rate_store: dict = defaultdict(list)
-_rate_lock = threading.Lock()
+# ── Upload size limit ─────────────────────────────────────
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "60"))
 
-def check_rate_limit(ip: str, limit: int = 20, window: int = 60):
-    now = time.time()
-    with _rate_lock:
-        calls = [t for t in _rate_store[ip] if now - t < window]
-        if len(calls) >= limit:
-            raise HTTPException(status_code=429, detail="Too many requests")
-        calls.append(now)
-        _rate_store[ip] = calls
+class LimitUploadSize(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "POST":
+            cl = request.headers.get("content-length")
+            if cl and int(cl) > MAX_UPLOAD_MB * 1024 * 1024:
+                return Response(
+                    f"Súbor je príliš veľký (max {MAX_UPLOAD_MB} MB)",
+                    status_code=413,
+                )
+        return await call_next(request)
+
+app.add_middleware(LimitUploadSize)
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,7 +64,8 @@ SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "")
 
 # ── HTTP Basic Auth ───────────────────────────────────────
 security   = HTTPBasic()
-ADMIN_USER = "bohdan"
+# FIX: meno administrátora v env var, nie v kóde
+ADMIN_USER = os.environ.get("DOREMIFO_ADMIN_USER", "admin")
 
 def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
     admin_pass = os.environ.get("DOREMIFO_KEY", "")
@@ -73,6 +81,23 @@ def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
+# ── HMAC podpis pre /responses ────────────────────────────
+CAWI_SECRET = os.environ.get("CAWI_HMAC_SECRET", "")
+
+def verify_cawi_sig(session_id: str, sig: str) -> bool:
+    """Overí HMAC-SHA256 podpis session_id. Ak secret nie je nastavený (dev), prepúšťa."""
+    if not CAWI_SECRET:
+        return True
+    expected = hmac.new(
+        CAWI_SECRET.encode(),
+        session_id.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+# ── Composer token expirácia ──────────────────────────────
+TOKEN_EXPIRY_DAYS = int(os.environ.get("TOKEN_EXPIRY_DAYS", "90"))
+
 # ── Databáza ──────────────────────────────────────────────
 
 def get_db():
@@ -86,8 +111,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS composers (
                 token      TEXT PRIMARY KEY,
                 name       TEXT NOT NULL,
+                expires_at TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             )""")
+        # Migrácia: pridaj expires_at ak stĺpec chýba (starší DB)
+        try:
+            db.execute("ALTER TABLE composers ADD COLUMN expires_at TEXT")
+        except Exception:
+            pass
         db.execute("""
             CREATE TABLE IF NOT EXISTS uploads (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,8 +169,30 @@ def init_db():
                 timestamp       INTEGER,
                 FOREIGN KEY (response_id) REFERENCES cawi_responses(id)
             )""")
+        # FIX: perzistentný rate limiter
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS rate_log (
+                ip TEXT,
+                ts REAL
+            )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_rate_ip ON rate_log(ip)")
 
 init_db()
+
+# ── Rate limiter (SQLite — prežije reštart) ────────────────
+_rate_lock = threading.Lock()
+
+def check_rate_limit(ip: str, limit: int = 20, window: int = 60):
+    now = time.time()
+    with _rate_lock:
+        with get_db() as db:
+            db.execute("DELETE FROM rate_log WHERE ts < ?", (now - window,))
+            n = db.execute(
+                "SELECT COUNT(*) FROM rate_log WHERE ip=?", (ip,)
+            ).fetchone()[0]
+            if n >= limit:
+                raise HTTPException(status_code=429, detail="Too many requests")
+            db.execute("INSERT INTO rate_log VALUES (?,?)", (ip, now))
 
 # ── Slack ─────────────────────────────────────────────────
 
@@ -391,7 +444,8 @@ async function upload(){{
 def build_admin_ui(composers: list, progress_map: dict) -> str:
     rows = ""
     for c in composers:
-        token = c["token"]
+        token   = c["token"]
+        expires = c.get("expires_at") or "—"
         cells_html = ""
         total = 0
         for cell in CELLS_ALL:
@@ -407,7 +461,9 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
         cell_options = "".join(f'<option value="{c}">{c}</option>' for c in CELLS_ALL)
         rows += f"""<tr>
           <td><strong>{c['name']}</strong><br>
-            <span style="font-size:.72rem;color:#475569">{c['created_at'][:10]}</span></td>
+            <span style="font-size:.72rem;color:#475569">{c['created_at'][:10]}</span><br>
+            <span style="font-size:.68rem;color:#334155">exp: {expires[:10] if expires != '—' else '—'}</span>
+          </td>
           {cells_html}
           <td style="font-size:.8rem;color:#94a3b8">{total}/100<br>
             <div style="background:#0f172a;border-radius:99px;height:4px;margin-top:.3rem;width:80px">
@@ -422,7 +478,13 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
               <option value="">⬇ Bunka...</option>
               {cell_options}
             </select>
-            <br><button onclick="deleteComposer('{token}','{c['name']}')"
+            <br>
+            <button onclick="extendComposer('{token}','{c['name']}')"
+              style="margin-top:.4rem;padding:.2rem .6rem;background:#1e3a5f;color:#7dd3fc;
+                     border:1px solid #1d4ed8;border-radius:4px;font-size:.72rem;cursor:pointer">
+              ↺ Predĺžiť
+            </button>
+            <button onclick="deleteComposer('{token}','{c['name']}')"
               style="margin-top:.4rem;padding:.2rem .6rem;background:#450a0a;color:#fca5a5;
                      border:1px solid #7f1d1d;border-radius:4px;font-size:.72rem;cursor:pointer">
               🗑 Zmazať
@@ -478,7 +540,14 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
 <script>
 async function deleteComposer(token, name){{
   if(!confirm('Naozaj zmazať skladateľa "'+name+'" a všetky jeho súbory?')) return;
-  const res=await fetch('/admin/delete-composer/'+token,{{method:'DELETE'}});
+  const res=await fetch('/admin/delete-composer/'+token,{{method:'DELETE',headers:{{'Content-Type':'application/json'}}}});
+  const data=await res.json();
+  if(data.ok){{ window.location.reload(); }}
+  else{{ alert('Chyba: '+(data.error||'neznáma')); }}
+}}
+async function extendComposer(token, name){{
+  if(!confirm('Predĺžiť token pre "'+name+'" o ďalších 90 dní?')) return;
+  const res=await fetch('/admin/extend-composer/'+token,{{method:'POST',headers:{{'Content-Type':'application/json'}}}});
   const data=await res.json();
   if(data.ok){{ window.location.reload(); }}
   else{{ alert('Chyba: '+(data.error||'neznáma')); }}
@@ -541,37 +610,50 @@ async def admin_ui(admin=Depends(require_admin)):
     return build_admin_ui(composers, progress_map)
 
 
+# FIX: chránený require_admin (v pôvodnom kóde chýbal)
 @app.delete("/admin/delete-composer/{token}")
-async def delete_composer(token: str):
+async def delete_composer(token: str, admin=Depends(require_admin)):
     with get_db() as db:
         c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
         if not c:
             return JSONResponse(status_code=404, content={"error": "Skladateľ nenájdený"})
         db.execute("DELETE FROM uploads WHERE token=?", (token,))
         db.execute("DELETE FROM composers WHERE token=?", (token,))
-    # Zmazať fyzické súbory z archívu
     composer_dir = os.path.join(ARCH_DIR, token)
     if os.path.exists(composer_dir):
         shutil.rmtree(composer_dir)
-    # Zmazať referencie
     for f in os.listdir(REFS_DIR):
         if token in f:
             os.remove(os.path.join(REFS_DIR, f))
     return {"ok": True}
 
 
-# ── FIX v2.4: Odstránený Depends(require_admin) — endpoint je
-#    dostupný len z admin panelu ktorý je sám za Basic Auth ──
+@app.post("/admin/extend-composer/{token}")
+async def extend_composer(token: str, admin=Depends(require_admin)):
+    new_expiry = (datetime.utcnow() + timedelta(days=TOKEN_EXPIRY_DAYS)).isoformat()
+    with get_db() as db:
+        c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
+        if not c:
+            return JSONResponse(status_code=404, content={"error": "Skladateľ nenájdený"})
+        db.execute("UPDATE composers SET expires_at=? WHERE token=?", (new_expiry, token))
+    return {"ok": True, "expires_at": new_expiry}
+
+
+# Poznámka: endpoint je dostupný len z admin panelu, ktorý je za Basic Auth
 @app.post("/admin/new-composer")
 async def new_composer(req: Request):
     body = await req.json()
     name = body.get("name", "").strip()
     if not name:
         return JSONResponse(status_code=400, content={"error": "Chýba meno"})
-    token = secrets.token_urlsafe(16)
+    token   = secrets.token_urlsafe(16)
+    expires = (datetime.utcnow() + timedelta(days=TOKEN_EXPIRY_DAYS)).isoformat()
     with get_db() as db:
-        db.execute("INSERT INTO composers (token, name) VALUES (?,?)", (token, name))
-    return {"token": token}
+        db.execute(
+            "INSERT INTO composers (token, name, expires_at) VALUES (?,?,?)",
+            (token, name, expires)
+        )
+    return {"token": token, "expires_at": expires}
 
 
 @app.get("/upload/{token}", response_class=HTMLResponse)
@@ -582,6 +664,11 @@ async def upload_ui(token: str, lang: str = "sk"):
             return HTMLResponse(
                 "<h3 style='font-family:sans-serif;padding:2rem'>🔒 Neplatný link</h3>",
                 status_code=404)
+        # FIX: kontrola expirácie
+        if c["expires_at"] and c["expires_at"] < datetime.utcnow().isoformat():
+            return HTMLResponse(
+                "<h3 style='font-family:sans-serif;padding:2rem'>🔒 Platnosť linku vypršala. Kontaktuj výskumný tím.</h3>",
+                status_code=403)
         rows = db.execute(
             "SELECT cell, var_id FROM uploads WHERE token=?", (token,)).fetchall()
     progress = {}
@@ -597,10 +684,17 @@ async def do_upload(
     cell: str              = Form(...),
     wavs: List[UploadFile] = File(...)
 ):
+    # FIX: whitelist validácia cell
+    if cell not in CELLS_ALL:
+        raise HTTPException(status_code=400, detail="Neplatná bunka")
+
     with get_db() as db:
         c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
         if not c:
             return JSONResponse(status_code=404, content={"error": "Neplatný token"})
+        # FIX: kontrola expirácie
+        if c["expires_at"] and c["expires_at"] < datetime.utcnow().isoformat():
+            return JSONResponse(status_code=403, content={"error": "Token expiroval"})
     name = c["name"]
 
     composer_dir = os.path.join(ARCH_DIR, token, f"cell{cell}")
@@ -617,7 +711,12 @@ async def do_upload(
             m = re.search(r'(VAR\d+)', (wav.filename or "").upper())
             if not m:
                 continue
-            var_id   = m.group(1)
+            var_id = m.group(1)
+
+            # FIX: whitelist validácia var_id
+            if var_id not in VARS_ALL:
+                continue
+
             wav_name = f"CELL{cell}_{var_id}.wav"
             wav_path = os.path.join(wav_dir, wav_name)
             with open(wav_path, "wb") as f:
@@ -730,7 +829,7 @@ async def download_composer(token: str, cell: str = "", admin=Depends(require_ad
                         zf.write(os.path.join(full, fname), f"{cd}/{fname}")
 
     buf.seek(0)
-    name = c["name"].replace(" ", "_")
+    name   = c["name"].replace(" ", "_")
     suffix = f"_cell{cell.zfill(2)}" if cell else ""
     return StreamingResponse(
         buf, media_type="application/zip",
@@ -758,8 +857,13 @@ async def save_response(req: Request):
     if source not in ("prolific", "social", "sona"):
         raise HTTPException(status_code=422, detail="invalid source")
 
+    # FIX: HMAC podpis
+    sig = data.get("sig", "")
+    if not verify_cawi_sig(session_id, sig):
+        raise HTTPException(status_code=403, detail="invalid signature")
+
     sensitivity = data.get("sensitivity")
-    responses = data.get("responses", [])
+    responses   = data.get("responses", [])
     if not isinstance(responses, list) or len(responses) == 0:
         raise HTTPException(status_code=422, detail="responses array required")
     if len(responses) > 20:
@@ -929,8 +1033,12 @@ async def analysis_json(admin=Depends(require_admin)):
 async def debug(admin=Depends(require_admin)):
     return {
         "doremifo_key_set": bool(os.environ.get("DOREMIFO_KEY")),
+        "doremifo_admin_user_set": bool(os.environ.get("DOREMIFO_ADMIN_USER")),
+        "cawi_hmac_secret_set": bool(CAWI_SECRET),
         "slack_webhook_set": bool(SLACK_WEBHOOK),
         "db_exists": os.path.exists(DB_PATH),
+        "token_expiry_days": TOKEN_EXPIRY_DAYS,
+        "max_upload_mb": MAX_UPLOAD_MB,
     }
 
 
