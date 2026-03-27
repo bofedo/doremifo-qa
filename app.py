@@ -801,11 +801,8 @@ async def export_responses(secret: str = "", fmt: str = "csv"):
 
 
 @app.get("/responses/stats")
-async def response_stats(secret: str = ""):
+async def response_stats(admin=Depends(require_admin)):
     """Rýchly prehľad zberu dát."""
-    if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
-
     with get_db() as db:
         total    = db.execute("SELECT COUNT(*) FROM cawi_responses").fetchone()[0]
         prolific = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE source='prolific'").fetchone()[0]
