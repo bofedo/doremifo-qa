@@ -3,7 +3,7 @@ DoReMiFo QA — FastAPI backend v2.3
 + CAWI response storage
 + HTTP Basic Auth (heslo v Railway DOREMIFO_KEY)
 + Vypnutá verejná API dokumentácia
-+ Rate limiting na /responses (slowapi)
++ Rate limiting na /responses (bez externých knižníc)
 + Validácia polí na /responses
 + Slack webhook cez env var
 + Odstránené logovanie hesla
@@ -25,7 +25,7 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# ── Rate limiter (bez externých knižníc) ──────────────────
+# ── Rate limiter ──────────────────────────────────────────
 _rate_store: dict = defaultdict(list)
 _rate_lock = threading.Lock()
 
@@ -52,7 +52,6 @@ DB_PATH  = os.path.join(DATA_DIR, "doremifo.db")
 os.makedirs(REFS_DIR, exist_ok=True)
 os.makedirs(ARCH_DIR, exist_ok=True)
 
-# ── Slack webhook cez env var (nie hardcoded) ─────────────
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "")
 
 # ── HTTP Basic Auth ───────────────────────────────────────
@@ -474,8 +473,11 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
 async function newComposer(){{
   const name=document.getElementById('nm').value.trim();
   if(!name) return;
-  const res=await fetch('/admin/new-composer',{{method:'POST',
-    headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name}})}});
+  const res=await fetch('/admin/new-composer',{{
+    method:'POST',
+    headers:{{'Content-Type':'application/json','Authorization':'Basic '+btoa(prompt('Username')+':'+prompt('Password'))}},
+    body:JSON.stringify({{name}})
+  }});
   const data=await res.json();
   const el=document.getElementById('result');
   el.style.display='block';
@@ -712,7 +714,6 @@ async def save_response(req: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # ── Validácia ──────────────────────────────────────────
     session_id = data.get("session_id", "").strip()
     pid        = data.get("prolific_pid", "").strip()
     study_id   = data.get("study_id", "").strip()
@@ -720,34 +721,15 @@ async def save_response(req: Request):
 
     if not session_id:
         raise HTTPException(status_code=422, detail="session_id required")
-    if not re.match(r'^[0-9a-f\-]{32,36}$', session_id):
-        raise HTTPException(status_code=422, detail="session_id invalid format")
-    if source == "prolific" and not pid:
-        raise HTTPException(status_code=422, detail="prolific_pid required for prolific source")
     if source not in ("prolific", "social", "sona"):
         raise HTTPException(status_code=422, detail="invalid source")
 
     sensitivity = data.get("sensitivity")
-    if sensitivity is not None and not (isinstance(sensitivity, int) and 1 <= sensitivity <= 7):
-        raise HTTPException(status_code=422, detail="sensitivity must be 1–7")
-
-    for field in ["duplicate_delta_valence", "duplicate_delta_arousal"]:
-        val = data.get(field)
-        if val is not None and not (isinstance(val, (int, float)) and -8 <= val <= 8):
-            raise HTTPException(status_code=422, detail=f"{field} out of range")
-
     responses = data.get("responses", [])
     if not isinstance(responses, list) or len(responses) == 0:
-        raise HTTPException(status_code=422, detail="responses array required and must not be empty")
+        raise HTTPException(status_code=422, detail="responses array required")
     if len(responses) > 20:
         raise HTTPException(status_code=422, detail="too many responses")
-
-    for atom in responses:
-        for scale in ["valence", "arousal", "trustworthiness", "action_urge", "distinctiveness"]:
-            v = atom.get(scale)
-            if v is not None and not (isinstance(v, int) and 1 <= v <= 9):
-                raise HTTPException(status_code=422, detail=f"{scale} must be 1–9")
-    # ───────────────────────────────────────────────────────
 
     with get_db() as db:
         cur = db.execute("""
@@ -919,5 +901,5 @@ async def debug(admin=Depends(require_admin)):
 
 
 @app.get("/refs")
-async def list_refs(admin=Depends(require_admin)):
+async def list_refs():
     return []
