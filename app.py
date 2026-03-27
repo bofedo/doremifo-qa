@@ -35,11 +35,11 @@ ADMIN_USER = "bohdan"
 ADMIN_PASS = os.environ.get("DOREMIFO_KEY", "")
 
 def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    if not ADMIN_USER or not ADMIN_PASS:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail="Admin credentials not configured")
+    admin_pass = os.environ.get("DOREMIFO_KEY", "")
+    if not admin_pass:
+        raise HTTPException(status_code=503, detail="Admin credentials not configured")
     ok_user = secrets.compare_digest(credentials.username.encode(), ADMIN_USER.encode())
-    ok_pass = secrets.compare_digest(credentials.password.encode(), ADMIN_PASS.encode())
+    ok_pass = secrets.compare_digest(credentials.password.encode(), admin_pass.encode())
     if not (ok_user and ok_pass):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
