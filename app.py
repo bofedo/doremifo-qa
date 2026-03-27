@@ -1,7 +1,8 @@
 """
-DoReMiFo QA — FastAPI backend v2.1
+DoReMiFo QA — FastAPI backend v2.2
 + CAWI response storage
-+ HTTP Basic Auth (heslo v Railway Variables)
++ HTTP Basic Auth (heslo v Railway DOREMIFO_KEY)
++ Vypnutá verejná API dokumentácia
 """
 
 import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv, threading
@@ -11,7 +12,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import List
 
-app = FastAPI(title="DoReMiFo QA")
+app = FastAPI(
+    title="DoReMiFo QA",
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,7 +38,6 @@ SLACK_WEBHOOK = "https://hooks.slack.com/services/TDR6LBBR6/B0APAPC2HRN/mMWQa8xw
 # ── HTTP Basic Auth ───────────────────────────────────────
 security   = HTTPBasic()
 ADMIN_USER = "bohdan"
-ADMIN_PASS = os.environ.get("DOREMIFO_KEY", "")
 
 def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
     import sys
@@ -49,22 +54,6 @@ def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"},
         )
     return credentials.username
-
-VARS_ALL  = [f"VAR{i:02d}" for i in range(1, 11)]
-CELLS_ALL = [f"{i:02d}" for i in range(1, 11)]
-
-CELL_NAMES = {
-    "sk": {
-        "01":"Stabilita / Konsonancia","02":"Introvertná statika","03":"Ascendentná energia",
-        "04":"Urgencia","05":"Neutrálna referencia","06":"Kinetická pulzácia",
-        "07":"Ascendentná gradácia","08":"Descendentná relaxácia","09":"Ruptúra","10":"Kadencia"
-    },
-    "en": {
-        "01":"Stability / Consonance","02":"Introverted Stasis","03":"Ascendant Energy",
-        "04":"Urgency","05":"Neutral Reference","06":"Kinetic Pulsation",
-        "07":"Ascendant Gradation","08":"Descendent Relaxation","09":"Rupture","10":"Cadence"
-    }
-}
 
 # ── Databáza ──────────────────────────────────────────────
 
@@ -175,6 +164,24 @@ def detect_source(json_path: str):
     except Exception:
         return "Neznámy", "Unknown"
 
+# ── Cells & Vars ──────────────────────────────────────────
+
+VARS_ALL  = [f"VAR{i:02d}" for i in range(1, 11)]
+CELLS_ALL = [f"{i:02d}" for i in range(1, 11)]
+
+CELL_NAMES = {
+    "sk": {
+        "01":"Stabilita / Konsonancia","02":"Introvertná statika","03":"Ascendentná energia",
+        "04":"Urgencia","05":"Neutrálna referencia","06":"Kinetická pulzácia",
+        "07":"Ascendentná gradácia","08":"Descendentná relaxácia","09":"Ruptúra","10":"Kadencia"
+    },
+    "en": {
+        "01":"Stability / Consonance","02":"Introverted Stasis","03":"Ascendant Energy",
+        "04":"Urgency","05":"Neutral Reference","06":"Kinetic Pulsation",
+        "07":"Ascendant Gradation","08":"Descendent Relaxation","09":"Rupture","10":"Cadence"
+    }
+}
+
 # ── Upload UI ─────────────────────────────────────────────
 
 def build_upload_ui(composer_name: str, progress: dict, lang: str = "sk") -> str:
@@ -273,8 +280,7 @@ def build_upload_ui(composer_name: str, progress: dict, lang: str = "sk") -> str
               cursor:pointer;transition:background .2s}}
   button.run:hover:not(:disabled){{background:#4f46e5}}
   button.run:disabled{{background:#1e293b;color:#475569;cursor:not-allowed}}
-  .status{{margin-top:1rem;padding:.65rem 1rem;border-radius:8px;
-           font-size:.85rem;display:none}}
+  .status{{margin-top:1rem;padding:.65rem 1rem;border-radius:8px;font-size:.85rem;display:none}}
   .status.info{{background:#1e3a5f;color:#7dd3fc;display:block}}
   .status.ok{{background:#052e16;color:#86efac;display:block}}
   .status.err{{background:#450a0a;color:#fca5a5;display:block}}
@@ -287,10 +293,7 @@ def build_upload_ui(composer_name: str, progress: dict, lang: str = "sk") -> str
   <h1>🎵 {t['greeting']}</h1>
   <p class="sub">{t['sub']}</p>
   <div class="total-progress">
-    <div class="prog-top">
-      <span>{t['progress_label']}</span>
-      <span>{total_uploaded} / 100</span>
-    </div>
+    <div class="prog-top"><span>{t['progress_label']}</span><span>{total_uploaded} / 100</span></div>
     <div class="prog-bg"><div class="prog-bar" style="width:{total_pct}%"></div></div>
   </div>
   <div class="section-label">{t['cell_label']}</div>
@@ -314,10 +317,7 @@ def build_upload_ui(composer_name: str, progress: dict, lang: str = "sk") -> str
 <script>
 const PROGRESS   = {json.dumps(progress)};
 const CELL_NAMES = {json.dumps(CELL_NAMES[lang])};
-const T = {{
-  processing:"{t['processing']}",done_all:"{t['done_all']}",
-  done_part:"{t['done_part']}",error:"{t['error']}",
-}};
+const T = {{processing:"{t['processing']}",done_all:"{t['done_all']}",done_part:"{t['done_part']}",error:"{t['error']}"}};
 const VARS = {json.dumps(VARS_ALL)};
 let selectedCell=null, files={{}};
 function reload(l){{window.location.href=window.location.pathname+'?lang='+l}}
@@ -358,11 +358,7 @@ async function upload(){{
     if(!res.ok) throw new Error(data.error||'Error');
     st.className='status ok';
     st.textContent=data.complete?T.done_all:T.done_part;
-    if(data.report_html){{
-      const w=window.open('','_blank');
-      w.document.write(data.report_html);
-      w.document.close();
-    }}
+    if(data.report_html){{const w=window.open('','_blank');w.document.write(data.report_html);w.document.close();}}
     setTimeout(()=>window.location.reload(),2000);
   }}catch(e){{
     st.className='status err';st.textContent=T.error+': '+e.message;btn.disabled=false;
@@ -399,8 +395,7 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
             </div></td>
           <td>
             <code style="font-size:.72rem;color:#7dd3fc">/upload/{token}</code><br>
-            <a href="/download/{token}"
-               style="font-size:.72rem;color:#4ade80;text-decoration:none">⬇ Všetko</a>
+            <a href="/download/{token}" style="font-size:.72rem;color:#4ade80;text-decoration:none">⬇ Všetko</a>
             &nbsp;
             <select onchange="if(this.value) window.location='/download/{token}?cell='+this.value.padStart(2,'0')"
               style="font-size:.72rem;background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:4px;padding:.1rem .3rem;cursor:pointer">
@@ -512,7 +507,7 @@ async def admin_ui(admin=Depends(require_admin)):
 
 
 @app.post("/admin/new-composer")
-async def new_composer(req: Request):
+async def new_composer(req: Request, admin=Depends(require_admin)):
     body = await req.json()
     name = body.get("name", "").strip()
     if not name:
@@ -730,46 +725,33 @@ async def save_response(req: Request):
                  ux_affordance, sem_diff, timestamp)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 response_id, pid, source,
-                atom.get("atom_index"),
-                atom.get("cell"),
-                atom.get("var"),
+                atom.get("atom_index"), atom.get("cell"), atom.get("var"),
                 int(atom.get("is_duplicate", False)),
-                atom.get("valence"),
-                atom.get("arousal"),
-                atom.get("trustworthiness"),
-                atom.get("action_urge"),
-                atom.get("distinctiveness"),
-                atom.get("attribute"),
-                atom.get("confidence"),
-                atom.get("ux_affordance"),
-                json.dumps(sem),
-                atom.get("timestamp"),
+                atom.get("valence"), atom.get("arousal"),
+                atom.get("trustworthiness"), atom.get("action_urge"),
+                atom.get("distinctiveness"), atom.get("attribute"),
+                atom.get("confidence"), atom.get("ux_affordance"),
+                json.dumps(sem), atom.get("timestamp"),
             ))
 
     slack_notify(
         f"🎵 *Sonic Atoms* — nová odpoveď!\n"
-        f"*PID:* {pid}\n"
-        f"*Zdroj:* {source}\n"
+        f"*PID:* {pid}\n*Zdroj:* {source}\n"
         f"*Atómov:* {len(data.get('responses', []))}"
     )
-
     return {"ok": True, "response_id": response_id}
 
 
 @app.get("/responses/export")
 async def export_responses(fmt: str = "csv", admin=Depends(require_admin)):
-
     with get_db() as db:
         atoms = db.execute("""
-            SELECT
-                r.prolific_pid, r.study_id, r.session_id, r.source,
+            SELECT r.prolific_pid, r.study_id, r.session_id, r.source,
                 r.sensitivity, r.headphone_flag, r.attention_flag,
-                r.hard_flag, r.duplicate_delta_valence,
-                r.duplicate_delta_arousal, r.completed_at,
-                a.atom_index, a.cell, a.var, a.is_duplicate,
-                a.valence, a.arousal, a.trustworthiness,
-                a.action_urge, a.distinctiveness,
-                a.attribute, a.confidence, a.ux_affordance, a.sem_diff
+                r.hard_flag, r.duplicate_delta_valence, r.duplicate_delta_arousal,
+                r.completed_at, a.atom_index, a.cell, a.var, a.is_duplicate,
+                a.valence, a.arousal, a.trustworthiness, a.action_urge,
+                a.distinctiveness, a.attribute, a.confidence, a.ux_affordance, a.sem_diff
             FROM cawi_atoms a
             JOIN cawi_responses r ON r.id = a.response_id
             ORDER BY r.id, a.atom_index
@@ -793,7 +775,6 @@ async def export_responses(fmt: str = "csv", admin=Depends(require_admin)):
 
 @app.get("/responses/stats")
 async def response_stats(admin=Depends(require_admin)):
-
     with get_db() as db:
         total    = db.execute("SELECT COUNT(*) FROM cawi_responses").fetchone()[0]
         prolific = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE source='prolific'").fetchone()[0]
@@ -802,21 +783,15 @@ async def response_stats(admin=Depends(require_admin)):
         flagged  = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE hard_flag=1").fetchone()[0]
         coverage = db.execute("""
             SELECT COUNT(*) FROM (
-                SELECT cell, var, COUNT(*) as n
-                FROM cawi_atoms
-                WHERE is_duplicate=0
-                GROUP BY cell, var
-                HAVING n >= 30
+                SELECT cell, var, COUNT(*) as n FROM cawi_atoms
+                WHERE is_duplicate=0 GROUP BY cell, var HAVING n >= 30
             )
         """).fetchone()[0]
 
     return {
-        "total_responses":    total,
-        "prolific":           prolific,
-        "social":             social,
-        "total_atom_ratings": atoms,
-        "hard_flagged":       flagged,
-        "variants_coverage":  f"{coverage}/100",
+        "total_responses": total, "prolific": prolific, "social": social,
+        "total_atom_ratings": atoms, "hard_flagged": flagged,
+        "variants_coverage": f"{coverage}/100",
     }
 
 
@@ -881,10 +856,9 @@ async def analysis_json(admin=Depends(require_admin)):
 
 
 @app.get("/debug")
-async def debug():
+async def debug(admin=Depends(require_admin)):
     return {
-        "admin_user_set": bool(ADMIN_USER),
-        "admin_pass_set": bool(ADMIN_PASS),
+        "doremifo_key_set": bool(os.environ.get("DOREMIFO_KEY")),
         "db_exists": os.path.exists(DB_PATH),
     }
 
