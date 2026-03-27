@@ -1,16 +1,15 @@
 """
-DoReMiFo QA — FastAPI backend v1.9
+DoReMiFo QA — FastAPI backend v2.0
 + CAWI response storage
++ HTTP Basic Auth (namiesto ?secret= v URL)
 """
 
-import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv
-from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException, Depends
+import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv, threading
+from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException, Depends, status
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import List
-
-security = HTTPBasic()
 
 app = FastAPI(title="DoReMiFo QA")
 
@@ -21,21 +20,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Admin Auth ────────────────────────────────────────
-
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASSWORD", "doremifo-admin")
-
-def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    ok_user = secrets.compare_digest(credentials.username.encode(), ADMIN_USER.encode())
-    ok_pass = secrets.compare_digest(credentials.password.encode(), ADMIN_PASS.encode())
-    if not (ok_user and ok_pass):
-        raise HTTPException(
-            status_code=401,
-            detail="Prístup zamietnutý",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
 DATA_DIR = "/app/data"
 REFS_DIR = os.path.join(DATA_DIR, "references")
 ARCH_DIR = os.path.join(DATA_DIR, "archive")
@@ -44,7 +28,22 @@ os.makedirs(REFS_DIR, exist_ok=True)
 os.makedirs(ARCH_DIR, exist_ok=True)
 
 SLACK_WEBHOOK = "https://hooks.slack.com/services/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"
-ADMIN_SECRET  = os.environ.get("ADMIN_SECRET", "doremifo-admin")
+
+# ── HTTP Basic Auth ───────────────────────────────────
+security    = HTTPBasic()
+ADMIN_USER  = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS  = os.environ.get("ADMIN_PASSWORD", "doremifo-admin")
+
+def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    ok_user = secrets.compare_digest(credentials.username.encode(), ADMIN_USER.encode())
+    ok_pass = secrets.compare_digest(credentials.password.encode(), ADMIN_PASS.encode())
+    if not (ok_user and ok_pass):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Prístup zamietnutý",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
 
 VARS_ALL  = [f"VAR{i:02d}" for i in range(1, 11)]
 CELLS_ALL = [f"{i:02d}" for i in range(1, 11)]
@@ -495,7 +494,7 @@ async def index():
 
 @app.get("/admin", response_class=HTMLResponse)
 @app.get("/admin/", response_class=HTMLResponse)
-async def admin_ui(_: None = Depends(require_admin)):
+async def admin_ui(admin=Depends(require_admin)):
     with get_db() as db:
         composers = [dict(r) for r in db.execute(
             "SELECT * FROM composers ORDER BY created_at DESC").fetchall()]
@@ -651,7 +650,7 @@ async def do_upload(
 
 
 @app.get("/download/{token}")
-async def download_composer(token: str, cell: str = "", _: None = Depends(require_admin)):
+async def download_composer(token: str, cell: str = "", admin=Depends(require_admin)):
     with get_db() as db:
         c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
         if not c:
@@ -754,7 +753,10 @@ async def save_response(req: Request):
 
 
 @app.get("/responses/export")
-async def export_responses(fmt: str = "csv", _: None = Depends(require_admin)):
+async def export_responses(secret: str = "", fmt: str = "csv"):
+    """Export všetkých CAWI dát ako CSV."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
 
     with get_db() as db:
         atoms = db.execute("""
@@ -789,7 +791,10 @@ async def export_responses(fmt: str = "csv", _: None = Depends(require_admin)):
 
 
 @app.get("/responses/stats")
-async def response_stats(_: None = Depends(require_admin)):
+async def response_stats(secret: str = ""):
+    """Rýchly prehľad zberu dát."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
 
     with get_db() as db:
         total    = db.execute("SELECT COUNT(*) FROM cawi_responses").fetchone()[0]
@@ -840,7 +845,7 @@ def _run_pipeline_bg(simulate: bool):
         analysis_status["running"] = False
 
 @app.post("/analysis/run")
-async def run_analysis(simulate: bool = False, _: None = Depends(require_admin)):
+async def run_analysis(simulate: bool = False, admin=Depends(require_admin)):
     if analysis_status["running"]:
         return {"ok": False, "message": "Pipeline already running"}
     t = threading.Thread(target=_run_pipeline_bg, args=(simulate,), daemon=True)
@@ -848,7 +853,7 @@ async def run_analysis(simulate: bool = False, _: None = Depends(require_admin))
     return {"ok": True, "message": "Pipeline started in background. Check /analysis/status for progress."}
 
 @app.get("/analysis/status")
-async def analysis_status_endpoint(_: None = Depends(require_admin)):
+async def analysis_status_endpoint(admin=Depends(require_admin)):
     return {
         "running": analysis_status["running"],
         "last_run": analysis_status["last_run"],
@@ -858,7 +863,10 @@ async def analysis_status_endpoint(_: None = Depends(require_admin)):
 
 
 @app.get("/analysis/report")
-async def analysis_report(_: None = Depends(require_admin)):
+async def analysis_report(secret: str = ""):
+    """Zobrazí HTML report poslednej analýzy."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
     report_path = os.path.join(DATA_DIR, "analysis", "sonic_atoms_report.html")
     if not os.path.exists(report_path):
         return HTMLResponse("<h3 style='font-family:sans-serif;padding:2rem'>⚠️ Report nenájdený. Spusti /analysis/run najprv.</h3>")
