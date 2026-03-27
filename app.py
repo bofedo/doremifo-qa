@@ -466,6 +466,16 @@ async function newComposer(){{
 
 # ── Routes ────────────────────────────────────────────────
 
+@app.get("/debug")
+async def debug():
+    return {
+        "admin_user_set": bool(os.environ.get("ADMIN_USER")),
+        "admin_pass_set": bool(os.environ.get("ADMIN_PASSWORD")),
+        "admin_user_val": os.environ.get("ADMIN_USER", "NOT SET"),
+        "db_exists": os.path.exists(DB_PATH),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return """<!DOCTYPE html>
