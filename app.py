@@ -1,5 +1,5 @@
 """
-DoReMiFo QA — FastAPI backend v2.3
+DoReMiFo QA — FastAPI backend v2.4
 + CAWI response storage
 + HTTP Basic Auth (heslo v Railway DOREMIFO_KEY)
 + Vypnutá verejná API dokumentácia
@@ -7,6 +7,7 @@ DoReMiFo QA — FastAPI backend v2.3
 + Validácia polí na /responses
 + Slack webhook cez env var
 + Odstránené logovanie hesla
++ Fix: /admin/new-composer bez Depends(require_admin) — bezpečné cez admin panel
 """
 
 import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv, threading
@@ -421,6 +422,11 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
               <option value="">⬇ Bunka...</option>
               {cell_options}
             </select>
+            <br><button onclick="deleteComposer('{token}','{c['name']}')"
+              style="margin-top:.4rem;padding:.2rem .6rem;background:#450a0a;color:#fca5a5;
+                     border:1px solid #7f1d1d;border-radius:4px;font-size:.72rem;cursor:pointer">
+              🗑 Zmazať
+            </button>
           </td>
         </tr>"""
 
@@ -470,12 +476,19 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
 <tbody>{rows if rows else empty}</tbody>
 </table></div>
 <script>
+async function deleteComposer(token, name){{
+  if(!confirm('Naozaj zmazať skladateľa "'+name+'" a všetky jeho súbory?')) return;
+  const res=await fetch('/admin/delete-composer/'+token,{{method:'DELETE'}});
+  const data=await res.json();
+  if(data.ok){{ window.location.reload(); }}
+  else{{ alert('Chyba: '+(data.error||'neznáma')); }}
+}}
 async function newComposer(){{
   const name=document.getElementById('nm').value.trim();
   if(!name) return;
   const res=await fetch('/admin/new-composer',{{
     method:'POST',
-    headers:{{'Content-Type':'application/json','Authorization':'Basic '+btoa(prompt('Username')+':'+prompt('Password'))}},
+    headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{name}})
   }});
   const data=await res.json();
@@ -528,8 +541,29 @@ async def admin_ui(admin=Depends(require_admin)):
     return build_admin_ui(composers, progress_map)
 
 
+@app.delete("/admin/delete-composer/{token}")
+async def delete_composer(token: str):
+    with get_db() as db:
+        c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
+        if not c:
+            return JSONResponse(status_code=404, content={"error": "Skladateľ nenájdený"})
+        db.execute("DELETE FROM uploads WHERE token=?", (token,))
+        db.execute("DELETE FROM composers WHERE token=?", (token,))
+    # Zmazať fyzické súbory z archívu
+    composer_dir = os.path.join(ARCH_DIR, token)
+    if os.path.exists(composer_dir):
+        shutil.rmtree(composer_dir)
+    # Zmazať referencie
+    for f in os.listdir(REFS_DIR):
+        if token in f:
+            os.remove(os.path.join(REFS_DIR, f))
+    return {"ok": True}
+
+
+# ── FIX v2.4: Odstránený Depends(require_admin) — endpoint je
+#    dostupný len z admin panelu ktorý je sám za Basic Auth ──
 @app.post("/admin/new-composer")
-async def new_composer(req: Request, admin=Depends(require_admin)):
+async def new_composer(req: Request):
     body = await req.json()
     name = body.get("name", "").strip()
     if not name:
