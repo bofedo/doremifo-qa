@@ -35,7 +35,9 @@ ADMIN_USER = "bohdan"
 ADMIN_PASS = os.environ.get("DOREMIFO_KEY", "")
 
 def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    import sys
     admin_pass = os.environ.get("DOREMIFO_KEY", "")
+    print(f"DEBUG require_admin: DOREMIFO_KEY={admin_pass}", file=sys.stderr, flush=True)
     if not admin_pass:
         raise HTTPException(status_code=503, detail="Admin credentials not configured")
     ok_user = secrets.compare_digest(credentials.username.encode(), ADMIN_USER.encode())
