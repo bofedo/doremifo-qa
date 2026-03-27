@@ -20,9 +20,11 @@ WORKDIR /app
 COPY analyze_cell.py .
 COPY analyze_cawi.py .
 COPY app.py .
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
 RUN mkdir -p /app/data/references /app/data/archive /app/data/analysis
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port 8000"]
+CMD ["./entrypoint.sh"]
