@@ -1,7 +1,7 @@
 """
-DoReMiFo QA — FastAPI backend v2.0
+DoReMiFo QA — FastAPI backend v2.1
 + CAWI response storage
-+ HTTP Basic Auth (namiesto ?secret= v URL)
++ HTTP Basic Auth (heslo v Railway Variables)
 """
 
 import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv, threading
@@ -29,12 +29,15 @@ os.makedirs(ARCH_DIR, exist_ok=True)
 
 SLACK_WEBHOOK = "https://hooks.slack.com/services/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"
 
-# ── HTTP Basic Auth ───────────────────────────────────
-security    = HTTPBasic()
-ADMIN_USER  = os.environ.get("ADMIN_USER", "bohdan")
-ADMIN_PASS  = os.environ.get("ADMIN_PASSWORD", "doremifo2026")
+# ── HTTP Basic Auth ───────────────────────────────────────
+security   = HTTPBasic()
+ADMIN_USER = os.environ.get("ADMIN_USER", "")
+ADMIN_PASS = os.environ.get("ADMIN_PASSWORD", "")
 
 def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    if not ADMIN_USER or not ADMIN_PASS:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Admin credentials not configured")
     ok_user = secrets.compare_digest(credentials.username.encode(), ADMIN_USER.encode())
     ok_pass = secrets.compare_digest(credentials.password.encode(), ADMIN_PASS.encode())
     if not (ok_user and ok_pass):
@@ -466,16 +469,6 @@ async function newComposer(){{
 
 # ── Routes ────────────────────────────────────────────────
 
-@app.get("/debug")
-async def debug():
-    return {
-        "admin_user_set": bool(os.environ.get("ADMIN_USER")),
-        "admin_pass_set": bool(os.environ.get("ADMIN_PASSWORD")),
-        "admin_user_val": os.environ.get("ADMIN_USER", "NOT SET"),
-        "db_exists": os.path.exists(DB_PATH),
-    }
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return """<!DOCTYPE html>
@@ -695,7 +688,6 @@ async def download_composer(token: str, cell: str = "", admin=Depends(require_ad
 
 @app.post("/responses")
 async def save_response(req: Request):
-    """Prijme kompletné dáta z jsPsych frontendu."""
     try:
         data = await req.json()
     except Exception:
@@ -763,10 +755,7 @@ async def save_response(req: Request):
 
 
 @app.get("/responses/export")
-async def export_responses(secret: str = "", fmt: str = "csv"):
-    """Export všetkých CAWI dát ako CSV."""
-    if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+async def export_responses(fmt: str = "csv", admin=Depends(require_admin)):
 
     with get_db() as db:
         atoms = db.execute("""
@@ -802,7 +791,7 @@ async def export_responses(secret: str = "", fmt: str = "csv"):
 
 @app.get("/responses/stats")
 async def response_stats(admin=Depends(require_admin)):
-    """Rýchly prehľad zberu dát."""
+
     with get_db() as db:
         total    = db.execute("SELECT COUNT(*) FROM cawi_responses").fetchone()[0]
         prolific = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE source='prolific'").fetchone()[0]
@@ -829,7 +818,7 @@ async def response_stats(admin=Depends(require_admin)):
     }
 
 
-import threading
+# ── Analysis Pipeline ─────────────────────────────────────
 
 analysis_status = {"running": False, "last_run": None, "error": None}
 
@@ -851,6 +840,7 @@ def _run_pipeline_bg(simulate: bool):
     finally:
         analysis_status["running"] = False
 
+
 @app.post("/analysis/run")
 async def run_analysis(simulate: bool = False, admin=Depends(require_admin)):
     if analysis_status["running"]:
@@ -858,6 +848,7 @@ async def run_analysis(simulate: bool = False, admin=Depends(require_admin)):
     t = threading.Thread(target=_run_pipeline_bg, args=(simulate,), daemon=True)
     t.start()
     return {"ok": True, "message": "Pipeline started in background. Check /analysis/status for progress."}
+
 
 @app.get("/analysis/status")
 async def analysis_status_endpoint(admin=Depends(require_admin)):
@@ -870,10 +861,7 @@ async def analysis_status_endpoint(admin=Depends(require_admin)):
 
 
 @app.get("/analysis/report")
-async def analysis_report(secret: str = ""):
-    """Zobrazí HTML report poslednej analýzy."""
-    if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+async def analysis_report(admin=Depends(require_admin)):
     report_path = os.path.join(DATA_DIR, "analysis", "sonic_atoms_report.html")
     if not os.path.exists(report_path):
         return HTMLResponse("<h3 style='font-family:sans-serif;padding:2rem'>⚠️ Report nenájdený. Spusti /analysis/run najprv.</h3>")
@@ -882,15 +870,21 @@ async def analysis_report(secret: str = ""):
 
 
 @app.get("/analysis/json")
-async def analysis_json(secret: str = ""):
-    """Vráti JSON výsledky poslednej analýzy."""
-    if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Prístup zamietnutý")
+async def analysis_json(admin=Depends(require_admin)):
     json_path = os.path.join(DATA_DIR, "analysis", "sonic_atoms_analysis.json")
     if not os.path.exists(json_path):
-        raise HTTPException(status_code=404, detail="JSON nenájdený. Spusti /analysis/run najprv.")
+        raise HTTPException(status_code=404, detail="JSON nenájdený.")
     with open(json_path) as f:
         return JSONResponse(json.load(f))
+
+
+@app.get("/debug")
+async def debug():
+    return {
+        "admin_user_set": bool(ADMIN_USER),
+        "admin_pass_set": bool(ADMIN_PASS),
+        "db_exists": os.path.exists(DB_PATH),
+    }
 
 
 @app.get("/refs")
