@@ -1,8 +1,12 @@
 """
-DoReMiFo QA — FastAPI backend v2.2
+DoReMiFo QA — FastAPI backend v2.3
 + CAWI response storage
 + HTTP Basic Auth (heslo v Railway DOREMIFO_KEY)
 + Vypnutá verejná API dokumentácia
++ Rate limiting na /responses (slowapi)
++ Validácia polí na /responses
++ Slack webhook cez env var
++ Odstránené logovanie hesla
 """
 
 import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv, threading
@@ -11,6 +15,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import List
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="DoReMiFo QA",
@@ -18,6 +27,9 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,16 +45,15 @@ DB_PATH  = os.path.join(DATA_DIR, "doremifo.db")
 os.makedirs(REFS_DIR, exist_ok=True)
 os.makedirs(ARCH_DIR, exist_ok=True)
 
-SLACK_WEBHOOK = "https://hooks.slack.com/services/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"
+# ── Slack webhook cez env var (nie hardcoded) ─────────────
+SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "")
 
 # ── HTTP Basic Auth ───────────────────────────────────────
 security   = HTTPBasic()
 ADMIN_USER = "bohdan"
 
 def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    import sys
     admin_pass = os.environ.get("DOREMIFO_KEY", "")
-    print(f"DEBUG require_admin: DOREMIFO_KEY={admin_pass}", file=sys.stderr, flush=True)
     if not admin_pass:
         raise HTTPException(status_code=503, detail="Admin credentials not configured")
     ok_user = secrets.compare_digest(credentials.username.encode(), ADMIN_USER.encode())
@@ -126,6 +137,8 @@ init_db()
 # ── Slack ─────────────────────────────────────────────────
 
 def slack_notify(msg: str):
+    if not SLACK_WEBHOOK:
+        return
     try:
         import urllib.request
         data = json.dumps({"text": msg}).encode()
@@ -684,16 +697,49 @@ async def download_composer(token: str, cell: str = "", admin=Depends(require_ad
 # ── CAWI Response Storage ─────────────────────────────────
 
 @app.post("/responses")
+@limiter.limit("20/minute")
 async def save_response(req: Request):
     try:
         data = await req.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    pid        = data.get("prolific_pid", "")
-    study_id   = data.get("study_id", "")
-    session_id = data.get("session_id", "")
+    # ── Validácia ──────────────────────────────────────────
+    session_id = data.get("session_id", "").strip()
+    pid        = data.get("prolific_pid", "").strip()
+    study_id   = data.get("study_id", "").strip()
     source     = data.get("source", "prolific")
+
+    if not session_id:
+        raise HTTPException(status_code=422, detail="session_id required")
+    if not re.match(r'^[0-9a-f\-]{32,36}$', session_id):
+        raise HTTPException(status_code=422, detail="session_id invalid format")
+    if source == "prolific" and not pid:
+        raise HTTPException(status_code=422, detail="prolific_pid required for prolific source")
+    if source not in ("prolific", "social", "sona"):
+        raise HTTPException(status_code=422, detail="invalid source")
+
+    sensitivity = data.get("sensitivity")
+    if sensitivity is not None and not (isinstance(sensitivity, int) and 1 <= sensitivity <= 7):
+        raise HTTPException(status_code=422, detail="sensitivity must be 1–7")
+
+    for field in ["duplicate_delta_valence", "duplicate_delta_arousal"]:
+        val = data.get(field)
+        if val is not None and not (isinstance(val, (int, float)) and -8 <= val <= 8):
+            raise HTTPException(status_code=422, detail=f"{field} out of range")
+
+    responses = data.get("responses", [])
+    if not isinstance(responses, list) or len(responses) == 0:
+        raise HTTPException(status_code=422, detail="responses array required and must not be empty")
+    if len(responses) > 20:
+        raise HTTPException(status_code=422, detail="too many responses")
+
+    for atom in responses:
+        for scale in ["valence", "arousal", "trustworthiness", "action_urge", "distinctiveness"]:
+            v = atom.get(scale)
+            if v is not None and not (isinstance(v, int) and 1 <= v <= 9):
+                raise HTTPException(status_code=422, detail=f"{scale} must be 1–9")
+    # ───────────────────────────────────────────────────────
 
     with get_db() as db:
         cur = db.execute("""
@@ -704,7 +750,7 @@ async def save_response(req: Request):
              completed_at, raw_json)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
             pid, study_id, session_id, source,
-            data.get("sensitivity"),
+            sensitivity,
             int(data.get("headphone_flag", False)),
             int(data.get("attention_flag", False)),
             int(data.get("hard_flag", False)),
@@ -715,7 +761,7 @@ async def save_response(req: Request):
         ))
         response_id = cur.lastrowid
 
-        for atom in data.get("responses", []):
+        for atom in responses:
             sem = atom.get("sem_diff", {})
             db.execute("""
                 INSERT INTO cawi_atoms
@@ -737,7 +783,7 @@ async def save_response(req: Request):
     slack_notify(
         f"🎵 *Sonic Atoms* — nová odpoveď!\n"
         f"*PID:* {pid}\n*Zdroj:* {source}\n"
-        f"*Atómov:* {len(data.get('responses', []))}"
+        f"*Atómov:* {len(responses)}"
     )
     return {"ok": True, "response_id": response_id}
 
@@ -859,10 +905,11 @@ async def analysis_json(admin=Depends(require_admin)):
 async def debug(admin=Depends(require_admin)):
     return {
         "doremifo_key_set": bool(os.environ.get("DOREMIFO_KEY")),
+        "slack_webhook_set": bool(SLACK_WEBHOOK),
         "db_exists": os.path.exists(DB_PATH),
     }
 
 
 @app.get("/refs")
-async def list_refs():
+async def list_refs(admin=Depends(require_admin)):
     return []
