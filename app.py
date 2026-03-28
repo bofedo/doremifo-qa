@@ -1,16 +1,17 @@
 """
-DoReMiFo QA — FastAPI backend v2.4
+DoReMiFo QA — FastAPI backend v3.0
++ Supabase / PostgreSQL (nahradenie SQLite)
 + CAWI response storage
 + HTTP Basic Auth (heslo v Railway DOREMIFO_KEY)
 + Vypnutá verejná API dokumentácia
 + Rate limiting na /responses (bez externých knižníc)
 + Validácia polí na /responses
 + Slack webhook cez env var
-+ Odstránené logovanie hesla
-+ Fix: /admin/new-composer bez Depends(require_admin) — bezpečné cez admin panel
 """
 
-import os, shutil, subprocess, tempfile, json, sqlite3, secrets, re, zipfile, io, csv, threading
+import os, shutil, subprocess, tempfile, json, secrets, re, zipfile, io, csv, threading
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException, Depends, status
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,7 +42,12 @@ def check_rate_limit(ip: str, limit: int = 20, window: int = 60):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://study.doremifo.com", "http://localhost"],
+    allow_origins=[
+        "https://play.doremifo.com",
+        "https://study.doremifo.com",
+        "https://app.doremifo.com",
+        "http://localhost",
+    ],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -49,10 +55,10 @@ app.add_middleware(
 DATA_DIR = "/app/data"
 REFS_DIR = os.path.join(DATA_DIR, "references")
 ARCH_DIR = os.path.join(DATA_DIR, "archive")
-DB_PATH  = os.path.join(DATA_DIR, "doremifo.db")
 os.makedirs(REFS_DIR, exist_ok=True)
 os.makedirs(ARCH_DIR, exist_ok=True)
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "")
 
 # ── HTTP Basic Auth ───────────────────────────────────────
@@ -73,73 +79,34 @@ def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
-# ── Databáza ──────────────────────────────────────────────
+# ── Databáza — PostgreSQL / Supabase ─────────────────────
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+class DB:
+    """Thin wrapper pre psycopg2 — zachováva vzor with get_db() as db: + db.execute()"""
+    def __init__(self, conn):
+        self.conn = conn
+        self.cur  = conn.cursor()
 
-def init_db():
-    with get_db() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS composers (
-                token      TEXT PRIMARY KEY,
-                name       TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now'))
-            )""")
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS uploads (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                token       TEXT NOT NULL,
-                cell        TEXT NOT NULL,
-                var_id      TEXT NOT NULL,
-                filename    TEXT,
-                source      TEXT,
-                uploaded_at TEXT DEFAULT (datetime('now')),
-                UNIQUE(token, cell, var_id)
-            )""")
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS cawi_responses (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                prolific_pid TEXT,
-                study_id     TEXT,
-                session_id   TEXT,
-                source       TEXT DEFAULT 'prolific',
-                sensitivity  INTEGER,
-                headphone_flag INTEGER DEFAULT 0,
-                attention_flag INTEGER DEFAULT 0,
-                hard_flag    INTEGER DEFAULT 0,
-                duplicate_delta_valence REAL,
-                duplicate_delta_arousal REAL,
-                completed_at TEXT,
-                raw_json     TEXT,
-                created_at   TEXT DEFAULT (datetime('now'))
-            )""")
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS cawi_atoms (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                response_id     INTEGER NOT NULL,
-                prolific_pid    TEXT,
-                source          TEXT,
-                atom_index      INTEGER,
-                cell            TEXT,
-                var             TEXT,
-                is_duplicate    INTEGER DEFAULT 0,
-                valence         INTEGER,
-                arousal         INTEGER,
-                trustworthiness INTEGER,
-                action_urge     INTEGER,
-                distinctiveness INTEGER,
-                attribute       TEXT,
-                confidence      INTEGER,
-                ux_affordance   TEXT,
-                sem_diff        TEXT,
-                timestamp       INTEGER,
-                FOREIGN KEY (response_id) REFERENCES cawi_responses(id)
-            )""")
+    def execute(self, sql: str, params=None):
+        self.cur.execute(sql, params or ())
+        return self.cur
 
-init_db()
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *args):
+        if exc_type:
+            self.conn.rollback()
+        else:
+            self.conn.commit()
+        self.cur.close()
+        self.conn.close()
+
+def get_db() -> DB:
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return DB(conn)
 
 # ── Slack ─────────────────────────────────────────────────
 
@@ -378,13 +345,14 @@ async function upload(){{
     if(!res.ok) throw new Error(data.error||'Error');
     st.className='status ok';
     st.textContent=data.complete?T.done_all:T.done_part;
-    if(data.report_html){{const w=window.open('','_blank');w.document.write(data.report_html);w.document.close();}}
     setTimeout(()=>window.location.reload(),2000);
   }}catch(e){{
-    st.className='status err';st.textContent=T.error+': '+e.message;btn.disabled=false;
+    st.className='status err';st.textContent=T.error+': '+e.message;
+    btn.disabled=false;
   }}
 }}
 </script></body></html>"""
+
 
 # ── Admin UI ──────────────────────────────────────────────
 
@@ -392,92 +360,74 @@ def build_admin_ui(composers: list, progress_map: dict) -> str:
     rows = ""
     for c in composers:
         token = c["token"]
-        cells_html = ""
-        total = 0
-        for cell in CELLS_ALL:
-            cnt = progress_map.get(token, {}).get(cell, 0)
-            total += cnt
-            if cnt == 10:
-                cells_html += '<td style="color:#4ade80;text-align:center;font-size:.8rem">✓</td>'
-            elif cnt > 0:
-                cells_html += f'<td style="color:#a5b4fc;text-align:center;font-size:.8rem">{cnt}</td>'
-            else:
-                cells_html += '<td style="color:#334155;text-align:center;font-size:.8rem">—</td>'
-        pct = round(total / 100 * 100)
-        cell_options = "".join(f'<option value="{c}">{c}</option>' for c in CELLS_ALL)
+        prog  = progress_map.get(token, {})
+        done_cells = sum(1 for v in prog.values() if v >= 10)
+        total_vars = sum(prog.values())
         rows += f"""<tr>
-          <td><strong>{c['name']}</strong><br>
-            <span style="font-size:.72rem;color:#475569">{c['created_at'][:10]}</span></td>
-          {cells_html}
-          <td style="font-size:.8rem;color:#94a3b8">{total}/100<br>
-            <div style="background:#0f172a;border-radius:99px;height:4px;margin-top:.3rem;width:80px">
-              <div style="width:{pct}%;background:#6366f1;height:4px;border-radius:99px"></div>
-            </div></td>
+          <td>{c['name']}</td>
+          <td><code style="font-size:.75rem">{token[:12]}…</code></td>
+          <td>{done_cells}/10 buniek · {total_vars}/100 var.</td>
           <td>
-            <code style="font-size:.72rem;color:#7dd3fc">/upload/{token}</code><br>
-            <a href="/download/{token}" style="font-size:.72rem;color:#4ade80;text-decoration:none">⬇ Všetko</a>
-            &nbsp;
-            <select onchange="if(this.value) window.location='/download/{token}?cell='+this.value.padStart(2,'0')"
-              style="font-size:.72rem;background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:4px;padding:.1rem .3rem;cursor:pointer">
-              <option value="">⬇ Bunka...</option>
-              {cell_options}
-            </select>
-            <br><button onclick="deleteComposer('{token}','{c['name']}')"
-              style="margin-top:.4rem;padding:.2rem .6rem;background:#450a0a;color:#fca5a5;
-                     border:1px solid #7f1d1d;border-radius:4px;font-size:.72rem;cursor:pointer">
-              🗑 Zmazať
-            </button>
+            <a href="/upload/{token}" target="_blank" style="color:#a5b4fc">Upload</a> ·
+            <a href="/download/{token}" style="color:#a5b4fc">ZIP</a> ·
+            <button onclick="del('{token}')"
+              style="background:#450a0a;color:#fca5a5;border:none;border-radius:4px;
+                     padding:.2rem .5rem;cursor:pointer;font-size:.75rem">Zmazať</button>
           </td>
         </tr>"""
 
-    cell_headers = "".join(f'<th style="text-align:center">C{c}</th>' for c in CELLS_ALL)
-    empty = '<tr><td colspan="14" style="color:#475569;text-align:center;padding:2rem">Zatiaľ žiadni skladatelia</td></tr>'
-
     return f"""<!DOCTYPE html>
-<html lang="sk"><head><meta charset="UTF-8"><title>DoReMiFo Admin</title>
+<html lang="sk"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DoReMiFo Admin</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;padding:2rem}}
-  h1{{font-size:1.4rem;color:#f1f5f9;margin-bottom:.3rem}}
-  .meta{{color:#64748b;font-size:.82rem;margin-bottom:2rem}}
-  .new-form{{background:#1e293b;border-radius:12px;padding:1.5rem;margin-bottom:2rem;
-             display:flex;gap:.8rem;flex-wrap:wrap;align-items:flex-end}}
-  .new-form label{{font-size:.8rem;color:#94a3b8;display:block;margin-bottom:.3rem}}
-  .new-form input{{padding:.55rem .8rem;background:#0f172a;color:#e2e8f0;
-    border:1px solid #334155;border-radius:8px;font-size:.9rem}}
-  .new-form button{{padding:.55rem 1.2rem;background:#6366f1;color:white;border:none;
-    border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer}}
-  .new-form button:hover{{background:#4f46e5}}
-  .result{{background:#052e16;color:#86efac;padding:.65rem 1rem;border-radius:8px;
-           font-size:.82rem;margin-bottom:1.5rem;display:none;word-break:break-all}}
-  .tbl-wrap{{overflow-x:auto}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       background:#0f172a;color:#e2e8f0;padding:2rem}}
+  h1{{font-size:1.4rem;color:#f1f5f9;margin-bottom:1.5rem}}
+  .card{{background:#1e293b;border-radius:12px;padding:1.5rem;margin-bottom:1.5rem}}
+  h2{{font-size:1rem;color:#94a3b8;margin-bottom:1rem}}
   table{{width:100%;border-collapse:collapse;font-size:.85rem}}
-  th{{background:#1e293b;color:#94a3b8;text-align:left;padding:.6rem .8rem;
-      font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}}
-  td{{padding:.6rem .8rem;border-bottom:1px solid #1e293b;vertical-align:middle}}
-  tr:hover td{{background:#1e293b55}}
+  th{{text-align:left;padding:.5rem .75rem;color:#64748b;font-size:.75rem;
+      text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #334155}}
+  td{{padding:.6rem .75rem;border-bottom:1px solid #1e293b}}
+  .add-form{{display:flex;gap:.5rem;margin-top:1rem}}
+  input{{flex:1;padding:.6rem .8rem;background:#0f172a;border:1px solid #334155;
+         border-radius:8px;color:#e2e8f0;font-size:.9rem}}
+  button.add{{padding:.6rem 1.2rem;background:#6366f1;color:white;border:none;
+              border-radius:8px;cursor:pointer;font-weight:600}}
+  .result{{margin-top:.75rem;padding:.6rem 1rem;background:#052e16;color:#86efac;
+           border-radius:8px;font-size:.82rem;display:none}}
+  .links{{display:flex;gap:1rem;flex-wrap:wrap}}
+  .links a{{color:#a5b4fc;font-size:.85rem;text-decoration:none}}
+  .links a:hover{{text-decoration:underline}}
 </style></head><body>
 <h1>🎵 DoReMiFo Admin</h1>
-<div class="meta">Správa skladateľov ·
-  <a href="/admin" style="color:#6366f1">Obnoviť</a> ·
-  <a href="/responses/stats" style="color:#a5b4fc">📊 CAWI stats</a> ·
-  <a href="/responses/export" style="color:#4ade80">⬇ Export CSV</a>
+<div class="card">
+  <h2>Rýchle linky</h2>
+  <div class="links">
+    <a href="/responses/stats" target="_blank">📊 Response stats</a>
+    <a href="/responses/export" target="_blank">⬇️ Export CSV</a>
+    <a href="/analysis/run" target="_blank">🔬 Spustiť analýzu</a>
+    <a href="/analysis/report" target="_blank">📄 Report</a>
+    <a href="/debug" target="_blank">🔧 Debug</a>
+  </div>
 </div>
-<div class="new-form">
-  <div><label>Meno skladateľa</label>
-    <input type="text" id="nm" placeholder="Jan Novak"></div>
-  <button onclick="newComposer()">Vygenerovať link</button>
+<div class="card">
+  <h2>Skladatelia ({len(composers)})</h2>
+  <table>
+    <thead><tr><th>Meno</th><th>Token</th><th>Progress</th><th>Akcie</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <div class="add-form">
+    <input id="nm" placeholder="Meno skladateľa" />
+    <button class="add" onclick="newComposer()">+ Pridať</button>
+  </div>
+  <div class="result" id="result"></div>
 </div>
-<div class="result" id="result"></div>
-<div class="tbl-wrap">
-<table><thead><tr>
-  <th>Skladateľ</th>{cell_headers}<th>Celkom</th><th>Link</th>
-</tr></thead>
-<tbody>{rows if rows else empty}</tbody>
-</table></div>
 <script>
-async function deleteComposer(token, name){{
-  if(!confirm('Naozaj zmazať skladateľa "'+name+'" a všetky jeho súbory?')) return;
+async function del(token){{
+  if(!confirm('Naozaj zmazať?')) return;
   const res=await fetch('/admin/delete-composer/'+token,{{method:'DELETE'}});
   const data=await res.json();
   if(data.ok){{ window.location.reload(); }}
@@ -498,6 +448,7 @@ async function newComposer(){{
   setTimeout(()=>window.location.reload(),3000);
 }}
 </script></body></html>"""
+
 
 # ── Routes ────────────────────────────────────────────────
 
@@ -531,8 +482,8 @@ async def index():
 @app.get("/admin/", response_class=HTMLResponse)
 async def admin_ui(admin=Depends(require_admin)):
     with get_db() as db:
-        composers = [dict(r) for r in db.execute(
-            "SELECT * FROM composers ORDER BY created_at DESC").fetchall()]
+        composers = list(db.execute(
+            "SELECT * FROM composers ORDER BY created_at DESC").fetchall())
         uploads = db.execute("SELECT token, cell, var_id FROM uploads").fetchall()
     progress_map = {}
     for u in uploads:
@@ -544,24 +495,20 @@ async def admin_ui(admin=Depends(require_admin)):
 @app.delete("/admin/delete-composer/{token}")
 async def delete_composer(token: str):
     with get_db() as db:
-        c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
+        c = db.execute("SELECT * FROM composers WHERE token=%s", (token,)).fetchone()
         if not c:
             return JSONResponse(status_code=404, content={"error": "Skladateľ nenájdený"})
-        db.execute("DELETE FROM uploads WHERE token=?", (token,))
-        db.execute("DELETE FROM composers WHERE token=?", (token,))
-    # Zmazať fyzické súbory z archívu
+        db.execute("DELETE FROM uploads WHERE token=%s", (token,))
+        db.execute("DELETE FROM composers WHERE token=%s", (token,))
     composer_dir = os.path.join(ARCH_DIR, token)
     if os.path.exists(composer_dir):
         shutil.rmtree(composer_dir)
-    # Zmazať referencie
     for f in os.listdir(REFS_DIR):
         if token in f:
             os.remove(os.path.join(REFS_DIR, f))
     return {"ok": True}
 
 
-# ── FIX v2.4: Odstránený Depends(require_admin) — endpoint je
-#    dostupný len z admin panelu ktorý je sám za Basic Auth ──
 @app.post("/admin/new-composer")
 async def new_composer(req: Request):
     body = await req.json()
@@ -570,20 +517,20 @@ async def new_composer(req: Request):
         return JSONResponse(status_code=400, content={"error": "Chýba meno"})
     token = secrets.token_urlsafe(16)
     with get_db() as db:
-        db.execute("INSERT INTO composers (token, name) VALUES (?,?)", (token, name))
+        db.execute("INSERT INTO composers (token, name) VALUES (%s,%s)", (token, name))
     return {"token": token}
 
 
 @app.get("/upload/{token}", response_class=HTMLResponse)
 async def upload_ui(token: str, lang: str = "sk"):
     with get_db() as db:
-        c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
+        c = db.execute("SELECT * FROM composers WHERE token=%s", (token,)).fetchone()
         if not c:
             return HTMLResponse(
                 "<h3 style='font-family:sans-serif;padding:2rem'>🔒 Neplatný link</h3>",
                 status_code=404)
         rows = db.execute(
-            "SELECT cell, var_id FROM uploads WHERE token=?", (token,)).fetchall()
+            "SELECT cell, var_id FROM uploads WHERE token=%s", (token,)).fetchall()
     progress = {}
     for r in rows:
         progress.setdefault(r["cell"], {})[r["var_id"]] = True
@@ -598,7 +545,7 @@ async def do_upload(
     wavs: List[UploadFile] = File(...)
 ):
     with get_db() as db:
-        c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
+        c = db.execute("SELECT * FROM composers WHERE token=%s", (token,)).fetchone()
         if not c:
             return JSONResponse(status_code=404, content={"error": "Neplatný token"})
     name = c["name"]
@@ -654,16 +601,20 @@ async def do_upload(
                 source_sk, _ = detect_source(json_path)
 
             with get_db() as db:
-                db.execute("""INSERT OR REPLACE INTO uploads
-                    (token, cell, var_id, filename, source) VALUES (?,?,?,?,?)""",
-                    (token, cell, var_id, wav_name, source_sk))
+                db.execute("""
+                    INSERT INTO uploads (token, cell, var_id, filename, source)
+                    VALUES (%s,%s,%s,%s,%s)
+                    ON CONFLICT (token, cell, var_id)
+                    DO UPDATE SET filename=EXCLUDED.filename, source=EXCLUDED.source
+                """, (token, cell, var_id, wav_name, source_sk))
 
             uploaded_now.append(var_id)
 
     with get_db() as db:
-        total_cell = db.execute(
-            "SELECT COUNT(*) as n FROM uploads WHERE token=? AND cell=?",
-            (token, cell)).fetchone()["n"]
+        row = db.execute(
+            "SELECT COUNT(*) as n FROM uploads WHERE token=%s AND cell=%s",
+            (token, cell)).fetchone()
+    total_cell = row["n"]
 
     complete = total_cell >= 10
     if complete:
@@ -708,7 +659,7 @@ async def do_upload(
 @app.get("/download/{token}")
 async def download_composer(token: str, cell: str = "", admin=Depends(require_admin)):
     with get_db() as db:
-        c = db.execute("SELECT * FROM composers WHERE token=?", (token,)).fetchone()
+        c = db.execute("SELECT * FROM composers WHERE token=%s", (token,)).fetchone()
         if not c:
             return JSONResponse(status_code=404, content={"error": "Skladateľ nenájdený"})
     composer_dir = os.path.join(ARCH_DIR, token)
@@ -730,7 +681,7 @@ async def download_composer(token: str, cell: str = "", admin=Depends(require_ad
                         zf.write(os.path.join(full, fname), f"{cd}/{fname}")
 
     buf.seek(0)
-    name = c["name"].replace(" ", "_")
+    name   = c["name"].replace(" ", "_")
     suffix = f"_cell{cell.zfill(2)}" if cell else ""
     return StreamingResponse(
         buf, media_type="application/zip",
@@ -772,7 +723,8 @@ async def save_response(req: Request):
              headphone_flag, attention_flag, hard_flag,
              duplicate_delta_valence, duplicate_delta_arousal,
              completed_at, raw_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id""", (
             pid, study_id, session_id, source,
             sensitivity,
             int(data.get("headphone_flag", False)),
@@ -783,7 +735,7 @@ async def save_response(req: Request):
             data.get("completed_at"),
             json.dumps(data),
         ))
-        response_id = cur.lastrowid
+        response_id = cur.fetchone()["id"]
 
         for atom in responses:
             sem = atom.get("sem_diff", {})
@@ -793,7 +745,7 @@ async def save_response(req: Request):
                  is_duplicate, valence, arousal, trustworthiness,
                  action_urge, distinctiveness, attribute, confidence,
                  ux_affordance, sem_diff, timestamp)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
                 response_id, pid, source,
                 atom.get("atom_index"), atom.get("cell"), atom.get("var"),
                 int(atom.get("is_duplicate", False)),
@@ -846,17 +798,19 @@ async def export_responses(fmt: str = "csv", admin=Depends(require_admin)):
 @app.get("/responses/stats")
 async def response_stats(admin=Depends(require_admin)):
     with get_db() as db:
-        total    = db.execute("SELECT COUNT(*) FROM cawi_responses").fetchone()[0]
-        prolific = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE source='prolific'").fetchone()[0]
-        social   = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE source='social'").fetchone()[0]
-        atoms    = db.execute("SELECT COUNT(*) FROM cawi_atoms WHERE is_duplicate=0").fetchone()[0]
-        flagged  = db.execute("SELECT COUNT(*) FROM cawi_responses WHERE hard_flag=1").fetchone()[0]
+        total    = db.execute("SELECT COUNT(*) as n FROM cawi_responses").fetchone()["n"]
+        prolific = db.execute("SELECT COUNT(*) as n FROM cawi_responses WHERE source='prolific'").fetchone()["n"]
+        social   = db.execute("SELECT COUNT(*) as n FROM cawi_responses WHERE source='social'").fetchone()["n"]
+        atoms    = db.execute("SELECT COUNT(*) as n FROM cawi_atoms WHERE is_duplicate=0").fetchone()["n"]
+        flagged  = db.execute("SELECT COUNT(*) as n FROM cawi_responses WHERE hard_flag=1").fetchone()["n"]
         coverage = db.execute("""
-            SELECT COUNT(*) FROM (
-                SELECT cell, var, COUNT(*) as n FROM cawi_atoms
-                WHERE is_duplicate=0 GROUP BY cell, var HAVING n >= 30
-            )
-        """).fetchone()[0]
+            SELECT COUNT(*) as n FROM (
+                SELECT cell, var FROM cawi_atoms
+                WHERE is_duplicate=0
+                GROUP BY cell, var
+                HAVING COUNT(*) >= 30
+            ) sub
+        """).fetchone()["n"]
 
     return {
         "total_responses": total, "prolific": prolific, "social": social,
@@ -878,8 +832,8 @@ def _run_pipeline_bg(simulate: bool):
         sys.path.insert(0, '/app')
         mod = importlib.import_module("analyze_cawi")
         out_dir = os.path.join(DATA_DIR, "analysis")
-        db = None if simulate else DB_PATH
-        results = mod.run_pipeline(db_path=db, out_dir=out_dir, simulate=simulate)
+        db_url = None if simulate else DATABASE_URL
+        results = mod.run_pipeline(db_path=db_url, out_dir=out_dir, simulate=simulate)
         analysis_status["last_run"] = results.get("generated_at")
     except Exception as e:
         import traceback
@@ -927,10 +881,18 @@ async def analysis_json(admin=Depends(require_admin)):
 
 @app.get("/debug")
 async def debug(admin=Depends(require_admin)):
+    db_ok = False
+    try:
+        with get_db() as db:
+            db.execute("SELECT 1")
+        db_ok = True
+    except Exception:
+        pass
     return {
         "doremifo_key_set": bool(os.environ.get("DOREMIFO_KEY")),
         "slack_webhook_set": bool(SLACK_WEBHOOK),
-        "db_exists": os.path.exists(DB_PATH),
+        "database_url_set": bool(DATABASE_URL),
+        "db_connected": db_ok,
     }
 
 
