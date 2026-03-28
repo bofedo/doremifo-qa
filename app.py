@@ -57,8 +57,9 @@ ARCH_DIR = os.path.join(DATA_DIR, "archive")
 os.makedirs(REFS_DIR, exist_ok=True)
 os.makedirs(ARCH_DIR, exist_ok=True)
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "")
+DATABASE_URL          = os.environ.get("DATABASE_URL", "")
+SLACK_WEBHOOK         = os.environ.get("SLACK_WEBHOOK", "")
+PROLIFIC_COMPLETE_URL = os.environ.get("PROLIFIC_COMPLETE_URL", "")
 
 # ── HTTP Basic Auth ───────────────────────────────────────
 security   = HTTPBasic()
@@ -760,7 +761,21 @@ async def save_response(req: Request):
         f"*PID:* {pid}\n*Zdroj:* {source}\n"
         f"*Atómov:* {len(responses)}"
     )
-    return {"ok": True, "response_id": response_id}
+    # ── hard_flag prepočet na backende ───────────────────
+    orig_map = {(r.get("cell"), r.get("var")): r for r in responses if not r.get("is_duplicate")}
+    dups = [r for r in responses if r.get("is_duplicate")]
+    dup_delta_v = data.get("duplicate_delta_valence")
+    dup_delta_a = data.get("duplicate_delta_arousal")
+    if dups and orig_map:
+        dup = dups[0]
+        key = (dup.get("cell"), dup.get("var"))
+        if key in orig_map:
+            dup_delta_v = abs((dup.get("valence") or 0) - (orig_map[key].get("valence") or 0))
+            dup_delta_a = abs((dup.get("arousal") or 0) - (orig_map[key].get("arousal") or 0))
+    hard_flag = 1 if (dup_delta_v and dup_delta_a and dup_delta_v > 3 and dup_delta_a > 3) else 0
+
+    completion_url = PROLIFIC_COMPLETE_URL if source == "prolific" else None
+    return {"ok": True, "response_id": response_id, "completion_url": completion_url}
 
 
 @app.get("/responses/export")
