@@ -46,7 +46,6 @@ app.add_middleware(
         "https://play.doremifo.com",
         "https://study.doremifo.com",
         "https://app.doremifo.com",
-        "http://localhost",
     ],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
@@ -493,7 +492,7 @@ async def admin_ui(admin=Depends(require_admin)):
 
 
 @app.delete("/admin/delete-composer/{token}")
-async def delete_composer(token: str):
+async def delete_composer(token: str, admin=Depends(require_admin)):
     with get_db() as db:
         c = db.execute("SELECT * FROM composers WHERE token=%s", (token,)).fetchone()
         if not c:
@@ -882,19 +881,17 @@ async def analysis_json(admin=Depends(require_admin)):
 @app.get("/debug")
 async def debug(admin=Depends(require_admin)):
     db_ok = False
-    db_error = None
     try:
         with get_db() as db:
             db.execute("SELECT 1")
         db_ok = True
-    except Exception as e:
-        db_error = str(e)
+    except Exception:
+        pass
     return {
         "doremifo_key_set": bool(os.environ.get("DOREMIFO_KEY")),
         "slack_webhook_set": bool(SLACK_WEBHOOK),
         "database_url_set": bool(DATABASE_URL),
         "db_connected": db_ok,
-        "db_error": db_error,
     }
 
 
